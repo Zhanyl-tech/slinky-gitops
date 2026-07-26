@@ -1,0 +1,38 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # The README promises `make up` works. Prove it on every push, against a real
+  # KinD cluster, rather than trusting that it still does.
+  bring-up:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: helm/kind-action@v1
+        with:
+          config: kind/cluster.yaml
+          cluster_name: slinky
+      - name: Install operator
+        run: make operator
+      - name: Deploy Slurm
+        run: make slurm
+      - name: Run a job
+        run: make job
+      - name: Rotate the auth key
+        run: make rotate
+      - name: Run a job after rotation
+        run: make job
+      - name: Roll back
+        run: make rollback
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - run: shellcheck -S warning scripts/*.sh

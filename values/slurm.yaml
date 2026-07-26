@@ -1,0 +1,11 @@
+# Slurm cluster values. Kept in git so the deployed shape is reviewable rather
+# than living in someone's shell history as a string of --set flags.
+nodesets:
+  slinky:
+    # One replica is enough on KinD; a real cluster scales this or adds
+    # nodesets per hardware class (see docs/autoscaling.md).
+    replicas: 1
+
+partitions:
+  all:
+    enabled: true
