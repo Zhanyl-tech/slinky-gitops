@@ -126,6 +126,19 @@ noticeably longer to appear in `sinfo` than its pod takes to reach `Running`.
 `make slurm` waits for actual registration rather than pod readiness, because
 pod-ready is not cluster-ready.
 
+## A note on CI
+
+The first CI run hung and was killed at the job timeout. The cause was mine, not
+Slinky's: `make slurm` waited for node registration with an unbounded `until`
+loop, so when the node did not come up there was no timeout and no diagnostics —
+just thirty minutes of silence.
+
+It is bounded now (`REGISTER_TIMEOUT`, default 600s) and dumps pod state,
+nodeset status and `describe` output on failure. CI also uses a two-node
+topology (`kind/cluster-ci.yaml`), because a GitHub runner is 2 vCPU / 7 GB and
+three KinD nodes plus cert-manager plus the operator leaves the slurmd pod
+nothing to schedule into.
+
 ## Layout
 
 ```

@@ -1,0 +1,9 @@
+# Smaller topology for CI. A GitHub runner is 2 vCPU / 7 GB; three KinD nodes
+# plus cert-manager plus the operator leaves the slurmd pod nothing to schedule
+# into, which is what hung the first CI run.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: slinky
+nodes:
+  - role: control-plane
+  - role: worker

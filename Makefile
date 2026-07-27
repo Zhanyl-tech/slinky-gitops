@@ -1,6 +1,9 @@
 CLUSTER  ?= slinky
 NS_SLURM ?= slurm
 NS_OP    ?= slinky
+# How long to wait for a compute node to register. Generous, because pulling
+# the Slurm images on a cold runner dominates.
+REGISTER_TIMEOUT ?= 600
 
 .PHONY: help up down cluster operator slurm status job rotate rotate-dry rollback clean
 
@@ -29,8 +32,20 @@ slurm: ## Deploy the Slurm cluster
 		--values values/slurm.yaml \
 		--namespace $(NS_SLURM) --create-namespace --timeout 8m
 	@echo "waiting for a node to register with the controller…"
-	@until kubectl -n $(NS_SLURM) exec slurm-controller-0 -c slurmctld -- \
-		sinfo --noheader 2>/dev/null | grep -qE 'idle|alloc|mix'; do sleep 10; done
+	@# Bounded, and noisy on failure. An unbounded wait here hangs CI until the
+	@# job timeout and reports nothing useful about why.
+	@deadline=$$(( $$(date +%s) + $(REGISTER_TIMEOUT) )); \
+	while [ $$(date +%s) -lt $$deadline ]; do \
+		if kubectl -n $(NS_SLURM) exec slurm-controller-0 -c slurmctld -- \
+			sinfo --noheader 2>/dev/null | grep -qE 'idle|alloc|mix'; then \
+			echo "  node registered"; exit 0; \
+		fi; sleep 10; \
+	done; \
+	echo "  no node registered within $(REGISTER_TIMEOUT)s — dumping state:"; \
+	kubectl -n $(NS_SLURM) get pods -o wide; \
+	kubectl -n $(NS_SLURM) get nodesets.slinky.slurm.net; \
+	kubectl -n $(NS_SLURM) describe pods -l app.kubernetes.io/name=slurmd | tail -40; \
+	exit 1
 
 status: ## Show cluster state
 	@echo; kubectl -n $(NS_SLURM) get pods
