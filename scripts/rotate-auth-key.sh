@@ -81,6 +81,14 @@ controller_pod() {
   k get pods -l app.kubernetes.io/component=controller -o name 2>/dev/null | head -1
 }
 
+# One line per node: "<name> <state>". Slurm suffixes the state with `*` when
+# the node is not responding, which is the signal this script cares about most.
+node_states() {
+  local c; c=$(controller_pod)
+  [ -n "$c" ] || return 1
+  k exec "$c" -c slurmctld -- sinfo -N --noheader -o '%N %t' 2>/dev/null
+}
+
 # copy_key <src-secret> <dst-secret> <key>
 # Routes through set_key so an immutable destination is handled the same way,
 # rather than failing only on the rollback path.
@@ -244,13 +252,30 @@ k rollout status statefulset -l app.kubernetes.io/instance=slurm --timeout="${TI
 
 # ── 6. Verify or roll back ──────────────────────────────────────────────────
 step "6/6  Verify"
+
+# What has to be true here, and what a weaker check misses.
+#
+# The only boundary this rotation can break is controller <-> slurmd: those two
+# authenticate to each other with the key that just changed. Everything else is
+# unaffected.
+#
+# This script originally verified by running `sinfo` inside the controller pod
+# and checking the exit code. That never crosses the boundary — slurmctld
+# answers a local client whether or not a single compute node ever came back —
+# so it returned 0 on a cluster with no usable compute. It printed
+# "authentication verified", resumed nothing that existed yet, and left a
+# cluster that could not run a job. CI caught it; a person would have caught it
+# at 3am.
+#
+# The signal that does cross the boundary is registration. A slurmd holding the
+# wrong key cannot register, and slurmctld marks it not-responding with a `*`
+# suffix on the state. So "every node has lost its `*`" IS the end-to-end auth
+# check, and it is the one the header of this file has always promised.
 verified=0
-deadline=$(( $(date +%s) + 180 ))
+deadline=$(( $(date +%s) + TIMEOUT ))
 while [ "$(date +%s)" -lt "$deadline" ]; do
-  ctl=$(controller_pod)
-  # sinfo round-trips through the auth plugin, so a clean answer proves the
-  # controller and the nodes replying to it agree on the new key.
-  if [ -n "$ctl" ] && k exec "$ctl" -c slurmctld -- sinfo --noheader >/dev/null 2>&1; then
+  states=$(node_states || true)
+  if [ -n "$states" ] && ! printf '%s\n' "$states" | grep -q '\*'; then
     verified=1
     break
   fi
@@ -258,17 +283,42 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
 done
 
 if [ "$verified" -ne 1 ]; then
-  warn "authentication check failed — rolling back"
+  warn "nodes did not re-register with the new key — rolling back"
+  printf '%s\n' "${states:-<no node state available>}" | sed 's/^/      /'
   copy_key "${AUTH_SECRET}${BACKUP_SUFFIX}" "$AUTH_SECRET" "slurm.key"
   [ "$ROTATE_JWT" -eq 1 ] && copy_key "${JWT_SECRET}${BACKUP_SUFFIX}" "$JWT_SECRET" "jwt.key"
   k rollout restart statefulset,deployment,daemonset -l app.kubernetes.io/instance=slurm >/dev/null 2>&1 || true
   die "rotation failed and was rolled back"
 fi
-ok "authentication verified"
+ok "all nodes re-registered — auth verified end to end"
 
+# Only now is there anything to resume. Resuming before this point is a no-op
+# against nodes that have not come back, and it does not repeat itself: the
+# node registers later, still drained, and stays that way.
 ctl=$(controller_pod)
 k exec "$ctl" -c slurmctld -- scontrol update NodeName=ALL State=RESUME >/dev/null 2>&1 || warn "could not resume nodes"
-ok "nodes resumed"
+
+# And confirm the resume actually took. "Ran the command" is not the property
+# we want; "a job could now be scheduled" is.
+schedulable=0
+deadline=$(( $(date +%s) + 120 ))
+while [ "$(date +%s)" -lt "$deadline" ]; do
+  states=$(node_states || true)
+  if printf '%s\n' "$states" | awk '{print $2}' | grep -qE '^(idle|mix|alloc)'; then
+    schedulable=1
+    break
+  fi
+  sleep 5
+done
+if [ "$schedulable" -ne 1 ]; then
+  # The key is fine — rolling it back would fix nothing. This is a drain that
+  # would not lift, so leave the cluster in a state a human can read. The exit
+  # trap would retry the resume that just failed, so take it off the path.
+  DRAINED=0
+  printf '%s\n' "${states:-<no node state available>}" | sed 's/^/      /'
+  die "nodes re-registered but none became schedulable; cluster is left drained"
+fi
+ok "nodes resumed and schedulable"
 
 cat <<EOF
 

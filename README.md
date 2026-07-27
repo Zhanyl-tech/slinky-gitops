@@ -126,18 +126,52 @@ noticeably longer to appear in `sinfo` than its pod takes to reach `Running`.
 `make slurm` waits for actual registration rather than pod readiness, because
 pod-ready is not cluster-ready.
 
-## A note on CI
+**A verification that does not cross the broken boundary always passes.** This
+one cost two CI runs and is the most useful thing in the repo — see below.
 
-The first CI run hung and was killed at the job timeout. The cause was mine, not
-Slinky's: `make slurm` waited for node registration with an unbounded `until`
-loop, so when the node did not come up there was no timeout and no diagnostics —
-just thirty minutes of silence.
+## What CI caught
 
-It is bounded now (`REGISTER_TIMEOUT`, default 600s) and dumps pod state,
-nodeset status and `describe` output on failure. CI also uses a two-node
-topology (`kind/cluster-ci.yaml`), because a GitHub runner is 2 vCPU / 7 GB and
-three KinD nodes plus cert-manager plus the operator leaves the slurmd pod
-nothing to schedule into.
+Two runs failed here, both on my code rather than on Slinky, and both worth
+writing down because they are the same mistake wearing different clothes.
+
+**Run 1 — thirty minutes of silence.** `make slurm` waited for node
+registration with an unbounded `until` loop. When the node did not come up
+there was no timeout and no diagnostics, so the job sat until GitHub killed it.
+Bounded now (`REGISTER_TIMEOUT`, default 600s), dumping pod state, nodeset
+status and `describe` output on failure. CI also uses a two-node topology
+(`kind/cluster-ci.yaml`), because a GitHub runner is 2 vCPU / 7 GB and three
+KinD nodes plus cert-manager plus the operator leaves the slurmd pod nothing to
+schedule into.
+
+**Run 2 — the rotation reported success on a cluster that could not run a
+job.** Every step printed a green tick, `Rotation complete` scrolled past, and
+the next line was:
+
+```
+srun: Required node not available (down, drained or reserved)
+```
+
+Rotation can only break one thing: the controller↔slurmd trust relationship,
+because that is what the rotated key authenticates. My verification step ran
+`sinfo` *inside the controller pod* and checked the exit code — which never
+touches that relationship. `slurmctld` answers a local client whether or not a
+single compute node ever came back. The check passed on an empty cluster.
+
+The signal that does cross the boundary is registration: a `slurmd` holding the
+wrong key cannot register, and `slurmctld` flags it not-responding with a `*`
+on the state. So *every node losing its `*`* is the end-to-end auth check, and
+it is what the script does now.
+
+The resume was wrong for the same reason. It fired immediately after the
+rollout restart, against nodes that had not come back yet, and `scontrol update
+State=RESUME` does not repeat itself — the node registered later, still
+drained, and stayed that way. Resume now happens after registration, and the
+script confirms a node actually reached `idle`/`mix`/`alloc` rather than
+trusting that the command ran.
+
+The general form, which is worth more than either bug: **a check that does not
+cross the boundary you might have broken will pass no matter what you broke.**
+Green ticks on a dead cluster are worse than a red one.
 
 ## Layout
 
