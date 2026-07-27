@@ -23,12 +23,24 @@ jobs:
         run: make slurm
       - name: Run a job
         run: make job
-      - name: Rotate the auth key
-        run: make rotate
-      - name: Run a job after rotation
+
+      # On Slinky v1.2 the in-place rotation does not propagate: a slurmd pod
+      # created after the Secret is replaced still mounts the previous key.
+      # See README "What CI caught". Until that is solved, the property worth
+      # testing is not that rotation succeeds — it is that a rotation which
+      # cannot work refuses to report success, rolls back, and leaves a cluster
+      # that still runs jobs. A silent green tick here is the actual hazard.
+      - name: Rotation refuses to lie and rolls back
+        run: |
+          if make rotate; then
+            echo "::error::make rotate reported success; propagation is known to fail on this version."
+            echo "If this is now genuinely fixed, update the README and make this step expect success."
+            exit 1
+          fi
+          echo "rotation failed and rolled back, as expected"
+
+      - name: Cluster still runs a job after the rollback
         run: make job
-      - name: Roll back
-        run: make rollback
 
   shellcheck:
     runs-on: ubuntu-latest

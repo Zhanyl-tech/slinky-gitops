@@ -91,11 +91,22 @@ What the script does about that:
    are gone before the window opens.
 3. **Backs up the current key** to `slurm-auth-slurm-previous`. Rollback is one
    command, not archaeology.
-4. **Verifies end to end.** `sinfo` round-trips through the auth plugin, so a
-   clean response proves the controller and the nodes agree on the new key.
-5. **Rolls back automatically** if that check fails.
-6. **Resumes nodes on any failure path.** A crash mid-rotation must not leave
-   the cluster drained and unschedulable.
+4. **Restarts every daemon that holds the key** — including slurmd, which
+   `kubectl rollout restart` does not reach (see below).
+5. **Verifies by measurement, not inference.** It reads `slurm.key` off disk
+   inside each slurmd pod and compares the hash to the Secret, then requires a
+   node to reach a genuinely schedulable state. Earlier versions checked
+   proxies for this and passed while the cluster was dead.
+6. **Rolls back automatically** if either check fails.
+7. **Resumes nodes on any failure path.** A crash mid-rotation must not leave
+   the cluster drained and unschedulable — and pod replacement always downs the
+   node, so the resume is mandatory rather than cosmetic.
+
+> **Status: the rotation does not currently succeed on Slinky v1.2.** Replacing
+> the Secret does not reach slurmd, for reasons documented in full under
+> [What CI caught](#what-ci-caught). The script detects that and rolls back
+> instead of reporting success. Read that section before using this on anything
+> you care about.
 
 Rotating `jwt.key` (`--jwt`) additionally invalidates every outstanding REST
 token. That is the point of a credential rotation, but it will page whoever
@@ -151,27 +162,99 @@ the next line was:
 srun: Required node not available (down, drained or reserved)
 ```
 
+Chasing that down turned up four defects in my own script and one in Slinky
+that I still cannot fully explain.
+
+### The checks that could not fail
+
 Rotation can only break one thing: the controller↔slurmd trust relationship,
-because that is what the rotated key authenticates. My verification step ran
-`sinfo` *inside the controller pod* and checked the exit code — which never
-touches that relationship. `slurmctld` answers a local client whether or not a
-single compute node ever came back. The check passed on an empty cluster.
+since that is what the rotated key authenticates. Two verification attempts
+both missed it, the same way:
 
-The signal that does cross the boundary is registration: a `slurmd` holding the
-wrong key cannot register, and `slurmctld` flags it not-responding with a `*`
-on the state. So *every node losing its `*`* is the end-to-end auth check, and
-it is what the script does now.
+| Check | Why it passed anyway |
+| --- | --- |
+| `sinfo` exits 0 | Never leaves the controller pod. `slurmctld` answers a local client whether or not a single node came back — it passes against zero compute. |
+| No `*` on any node state | Crosses the boundary, but raced the restart. It passed **130 ms** after the rollout, reading the node as it was *before* the new key applied. |
 
-The resume was wrong for the same reason. It fired immediately after the
-rollout restart, against nodes that had not come back yet, and `scontrol update
-State=RESUME` does not repeat itself — the node registered later, still
-drained, and stayed that way. Resume now happens after registration, and the
-script confirms a node actually reached `idle`/`mix`/`alloc` rather than
-trusting that the command ran.
+A third was subtler: `grep -E '^(idle|mix|alloc)'` also matches **`idle*`**, and
+that trailing `*` means *slurmctld cannot reach the node* — the precise failure
+the check existed to catch. It is anchored at both ends now.
 
-The general form, which is worth more than either bug: **a check that does not
+A fourth: the wait for replacement pods had no success flag, so on timeout it
+fell out of the loop straight into the line that prints a green tick. Every one
+of these is the same bug — **a check that cannot fail.**
+
+### `rollout restart` never restarted slurmd
+
+```
+$ kubectl -n slurm get statefulset,deployment,daemonset -l app.kubernetes.io/instance=slurm
+statefulset.apps/slurm-controller
+deployment.apps/slurm-restapi
+$ kubectl -n slurm get pod slurm-worker-slinky-0 -o jsonpath='{.metadata.ownerReferences[*].kind}'
+NodeSet
+```
+
+`NodeSet` is a CRD, so `kubectl rollout restart` — which only knows built-in
+kinds — silently skipped the one daemon on the far side of the boundary being
+rotated. The controller adopted the new key in seconds and slurmd kept the old
+one. Deleting the pods is the supported way to cycle them.
+
+And replacing a slurmd pod leaves the node **down**, not drained:
+
+```
+$ sinfo -R
+slurm-operator: Pod   root   2026-07-27T01:41:40   slinky-0
+```
+
+The operator sets that and never clears it — ninety seconds of watching showed
+no self-heal. So an explicit `RESUME` is mandatory after any pod replacement,
+and it must be re-issued rather than fired once.
+
+### The part I could not fix: the key does not propagate
+
+With all of that corrected, rotation still fails — and now says so. On a clean
+KinD cluster, with the Secret holding a new key and stable for five minutes, a
+slurmd pod deleted and recreated from scratch came up mounting the **previous**
+key:
+
+```
+secret                        sha c5016281…
+slurmd pod created 02:28:25   sha 8cbda076…    ← the pre-rotation key
+slurmctld                     sha c5016281…    ← correct
+```
+
+with `_fetch_child: failed to fetch remote configs: Protocol authentication
+error` in the slurmd log until the node went down.
+
+Slinky ships the auth Secret `immutable: true`, so its data cannot be patched
+and delete-and-recreate is the only route. After that, the node's kubelet keeps
+serving its cached copy to newly created pods. Things I checked, so the record
+is honest about what is and is not established:
+
+- **Not the operator rewriting the Secret** — it held one value, `rv` unchanged, for 90s.
+- **Not immutability itself** — recreating the replacement as *mutable* behaves identically.
+- **Not universal** — the same delete-and-recreate against a Secret that node had never cached propagates immediately, which is why a naive control test made me dismiss this too early.
+
+The trigger appears to be a pre-existing cache entry on that node, but I have
+not pinned it to a specific kubelet code path, so the repo does not claim one.
+
+**What the script does about it:** it reads the key off disk inside every
+slurmd pod and compares it to the Secret. On mismatch it rolls back and exits
+non-zero. That is the whole point — a rotation that cannot work must not print
+a green tick, because "answers `sinfo`, cannot run a job" is the worst state to
+hand someone.
+
+The likely real fix is versioned Secret names (`slurm-auth-slurm-<n>`, repoint
+the NodeSet) so pods mount an object no kubelet has cached. That is a
+chart-level change and is **not implemented here**.
+
+CI asserts the safety property rather than a success it cannot have: `make
+rotate` must fail, and the cluster must still run a job afterwards.
+
+The general form is worth more than any single bug: **a check that does not
 cross the boundary you might have broken will pass no matter what you broke.**
-Green ticks on a dead cluster are worse than a red one.
+Green ticks on a dead cluster are worse than a red one, because they stop you
+looking.
 
 ## Layout
 
