@@ -59,6 +59,11 @@ status: ## Show cluster state
 JOB_WAIT ?= 120
 
 job: ## Run a job end to end
+	@# Wait for the controller first. Exec'ing into a restarting pod fails with
+	@# `container not found ("slurmctld")`, which looks like a broken cluster and
+	@# is really just an impatient client.
+	@kubectl -n $(NS_SLURM) wait --for=condition=ready pod \
+		-l app.kubernetes.io/component=controller --timeout=180s >/dev/null 2>&1 || true
 	@kubectl -n $(NS_SLURM) exec slurm-controller-0 -c slurmctld -- \
 		bash -lc 'srun --partition=all --ntasks=1 --time=1 --immediate=$(JOB_WAIT) hostname' && exit 0; \
 	echo "  job did not start within $(JOB_WAIT)s:"; \

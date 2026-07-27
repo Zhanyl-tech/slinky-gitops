@@ -137,6 +137,65 @@ slurmd_key_shas() {
   done
 }
 
+# Any path that restarts the controller must wait for it before touching it.
+# Without this, the very next `kubectl exec` races the restart and dies with
+#   error: ... unable to upgrade connection: container not found ("slurmctld")
+# which reads like a broken cluster and is really just an impatient script.
+wait_controller_ready() {
+  k wait --for=condition=ready pod \
+    -l app.kubernetes.io/component=controller --timeout="${1:-180}s" >/dev/null 2>&1
+}
+
+# Resume until a node is genuinely schedulable, re-issuing every pass.
+#
+# One RESUME is not enough and never was. Replacing a slurmd pod makes the
+# operator mark the node down (`Reason: slurm-operator: Pod`) and it never
+# clears that itself, so a resume fired before the pod comes back is simply
+# lost — which is how a cluster ended up drained for the 43 minutes it took CI
+# to give up. Returns non-zero if nothing became schedulable in time, and the
+# caller is expected to care.
+resume_until_schedulable() {
+  local deadline c st
+  deadline=$(( $(date +%s) + ${1:-180} ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    c=$(controller_pod)
+    [ -n "$c" ] && k exec "$c" -c slurmctld -- \
+      scontrol update NodeName=ALL State=RESUME >/dev/null 2>&1 || true
+    st=$(node_states || true)
+    # Anchored both ends: `^(idle|mix|alloc)` also matches `idle*`, and that
+    # trailing star means slurmctld cannot reach the node — the failure itself.
+    if printf '%s\n' "$st" | awk '{print $2}' | grep -qE '^(idle|mix|alloc)$'; then
+      return 0
+    fi
+    sleep 5
+  done
+  return 1
+}
+
+# Restore the previous key and leave the cluster usable.
+#
+# Rolling back is not just putting the old bytes back: it restarts the
+# controller and cycles slurmd, so the cluster is briefly unusable in exactly
+# the way the rotation was. Returning before it settles hands the caller a
+# cluster that cannot run a job, which is the thing this whole script exists to
+# avoid — CI caught precisely that.
+restore_previous_and_settle() {
+  copy_key "${AUTH_SECRET}${BACKUP_SUFFIX}" "$AUTH_SECRET" "slurm.key"
+  [ "$ROTATE_JWT" -eq 1 ] && copy_key "${JWT_SECRET}${BACKUP_SUFFIX}" "$JWT_SECRET" "jwt.key"
+  k rollout restart statefulset,deployment,daemonset -l app.kubernetes.io/instance=slurm >/dev/null 2>&1 || true
+  k delete pod -l app.kubernetes.io/name=slurmd --wait=false >/dev/null 2>&1 || true
+  ok "previous key restored"
+
+  wait_controller_ready 240 || warn "controller did not become ready"
+  if resume_until_schedulable 300; then
+    ok "cluster back to schedulable on the previous key"
+    DRAINED=0   # nothing left for the exit trap to do
+  else
+    warn "cluster did not return to a schedulable state:"
+    printf '%s\n' "$(node_states || echo '<no node state available>')" | sed 's/^/      /'
+  fi
+}
+
 # copy_key <src-secret> <dst-secret> <key>
 # Routes through set_key so an immutable destination is handled the same way,
 # rather than failing only on the rollback path.
@@ -345,8 +404,7 @@ if [ "$replaced" -ne 1 ]; then
   warn "slurmd pods did not come back — rolling back"
   k get pods -l app.kubernetes.io/name=slurmd -o wide 2>&1 | sed 's/^/      /'
   k get nodesets.slinky.slurm.net 2>&1 | sed 's/^/      /'
-  copy_key "${AUTH_SECRET}${BACKUP_SUFFIX}" "$AUTH_SECRET" "slurm.key"
-  [ "$ROTATE_JWT" -eq 1 ] && copy_key "${JWT_SECRET}${BACKUP_SUFFIX}" "$JWT_SECRET" "jwt.key"
+  restore_previous_and_settle
   die "rotation failed and was rolled back"
 fi
 ok "slurmd pods replaced"
@@ -381,10 +439,7 @@ if [ "$propagated" -ne 1 ]; then
   warn "slurmd never picked up the new key — rolling back"
   note "want $want_sha"
   printf '%s\n' "${have:-<no slurmd pod reachable>}" | sed 's/^/      have /'
-  copy_key "${AUTH_SECRET}${BACKUP_SUFFIX}" "$AUTH_SECRET" "slurm.key"
-  [ "$ROTATE_JWT" -eq 1 ] && copy_key "${JWT_SECRET}${BACKUP_SUFFIX}" "$JWT_SECRET" "jwt.key"
-  k rollout restart statefulset,deployment,daemonset -l app.kubernetes.io/instance=slurm >/dev/null 2>&1 || true
-  k delete pod -l app.kubernetes.io/name=slurmd --wait=false >/dev/null 2>&1 || true
+  restore_previous_and_settle
   die "rotation failed and was rolled back"
 fi
 ok "slurmd holding the new key"
@@ -421,40 +476,18 @@ step "6/6  Verify"
 #
 # — and never clears it. Ninety seconds of watching showed no self-heal. The
 # node sits down until something resumes it.
-# Resume is re-issued every pass rather than once. The operator can mark a node
-# down again while the replacement pods settle, and a single RESUME does not
-# repeat itself — that one-shot is exactly what left a cluster drained for the
-# 43 minutes it took CI to give up.
-schedulable=0
-deadline=$(( $(date +%s) + TIMEOUT ))
-while [ "$(date +%s)" -lt "$deadline" ]; do
-  ctl=$(controller_pod)
-  [ -n "$ctl" ] && k exec "$ctl" -c slurmctld -- \
-    scontrol update NodeName=ALL State=RESUME >/dev/null 2>&1 || true
-  states=$(node_states || true)
-  # Anchored at both ends on purpose. `^(idle|mix|alloc)` also matches `idle*`,
-  # and `idle*` is a node slurmctld cannot reach — precisely the failure this
-  # check exists to catch. An unanchored match here reported success on a
-  # cluster whose only node was `idle*` and whose jobs would not start.
-  if printf '%s\n' "$states" | awk '{print $2}' | grep -qE '^(idle|mix|alloc)$'; then
-    schedulable=1
-    break
-  fi
-  sleep 5
-done
+wait_controller_ready 240 || warn "controller did not become ready"
 
-if [ "$schedulable" -ne 1 ]; then
+if ! resume_until_schedulable "$TIMEOUT"; then
   # No node reached a schedulable state, which is what a slurmd that cannot
   # authenticate looks like from here. Roll back rather than leave a cluster
   # that answers sinfo but cannot run anything.
   warn "no node became schedulable with the new key — rolling back"
-  printf '%s\n' "${states:-<no node state available>}" | sed 's/^/      /'
-  copy_key "${AUTH_SECRET}${BACKUP_SUFFIX}" "$AUTH_SECRET" "slurm.key"
-  [ "$ROTATE_JWT" -eq 1 ] && copy_key "${JWT_SECRET}${BACKUP_SUFFIX}" "$JWT_SECRET" "jwt.key"
-  k rollout restart statefulset,deployment,daemonset -l app.kubernetes.io/instance=slurm >/dev/null 2>&1 || true
-  k delete pod -l app.kubernetes.io/name=slurmd --wait=false >/dev/null 2>&1 || true
+  printf '%s\n' "$(node_states || echo '<no node state available>')" | sed 's/^/      /'
+  restore_previous_and_settle
   die "rotation failed and was rolled back"
 fi
+DRAINED=0   # cluster is schedulable; nothing for the exit trap to undo
 ok "node schedulable with the new key — auth verified end to end"
 
 cat <<EOF
