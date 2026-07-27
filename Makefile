@@ -52,9 +52,19 @@ status: ## Show cluster state
 	@echo; kubectl -n $(NS_SLURM) get nodesets.slinky.slurm.net
 	@echo; kubectl -n $(NS_SLURM) exec slurm-controller-0 -c slurmctld -- sinfo
 
+# A plain `srun` queues and waits forever when no node is available, which
+# turns "the cluster is broken" into an indefinite hang with no output.
+# `--immediate=N` gives up if the allocation cannot be granted in N seconds.
+# (Not `--wait`, which is the grace period after the first task exits.)
+JOB_WAIT ?= 120
+
 job: ## Run a job end to end
 	@kubectl -n $(NS_SLURM) exec slurm-controller-0 -c slurmctld -- \
-		bash -lc 'srun --partition=all --ntasks=1 --time=1 hostname'
+		bash -lc 'srun --partition=all --ntasks=1 --time=1 --immediate=$(JOB_WAIT) hostname' && exit 0; \
+	echo "  job did not start within $(JOB_WAIT)s:"; \
+	kubectl -n $(NS_SLURM) exec slurm-controller-0 -c slurmctld -- sinfo -N -l 2>/dev/null || true; \
+	kubectl -n $(NS_SLURM) exec slurm-controller-0 -c slurmctld -- squeue -l 2>/dev/null || true; \
+	exit 1
 
 rotate-dry: ## Preview an auth key rotation
 	@./scripts/rotate-auth-key.sh -n $(NS_SLURM) --dry-run
