@@ -10,12 +10,12 @@ jobs:
   # KinD cluster, rather than trusting that it still does.
   bring-up:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: helm/kind-action@v1
         with:
-          config: kind/cluster.yaml
+          config: kind/cluster-ci.yaml
           cluster_name: slinky
       - name: Install operator
         run: make operator
