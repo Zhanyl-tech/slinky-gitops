@@ -286,6 +286,17 @@ real Slurm cluster needed.
 - **No login node.** Jobs are submitted from the controller pod. A `LoginSet` CR
   exists in the CRDs and is not deployed here.
 
+## The set
+
+Part of a set of tools covering the lifecycle of a GPU allocation, each built on
+the same rule — never act on absent evidence:
+
+- **slinky-gitops** — this repo. Running Slurm on Kubernetes.
+- **[gpu-reaper](https://github.com/Zhanyl-tech/gpu-reaper)** — wasted GPUs during a job.
+- **[ib-slurm-exporter](https://github.com/Zhanyl-tech/ib-slurm-exporter)** — fabric problems attributed to the job.
+- **[epilog-gpu-validator](https://github.com/Zhanyl-tech/epilog-gpu-validator)** — GPU hardware faults between jobs.
+- **[slurm-scheduler-lab](https://github.com/Zhanyl-tech/slurm-scheduler-lab)** — the scheduling policy behind it all.
+
 ## License
 
 MIT
