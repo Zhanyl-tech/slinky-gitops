@@ -1,0 +1,132 @@
+<svg width="1200" height="730" viewBox="0 0 1200 730" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="ttl dsc">
+<title id="ttl">Rotating auth/slurm on Slinky: where the key stops propagating</title>
+<desc id="dsc">The Kubernetes Secret holds the new key. slurmctld adopts it. slurmd is served a stale cached copy by the kubelet, so the controller-to-slurmd trust boundary breaks and the rotation is rolled back.</desc>
+
+<rect width="1200" height="730" fill="#1a1520"/>
+
+<rect width="1200" height="86" fill="#241c26"/>
+<rect width="6" height="86" fill="#f5b544"/>
+<text x="44" y="38" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif" font-size="25" font-weight="700" fill="#e9eff5">Rotating auth/slurm on Slinky - where the key stops propagating</text>
+<text x="44" y="66" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif" font-size="14.5" fill="#828c98">Slurm 26.05 / Slinky operator v1.2 / measured on a clean KinD cluster</text>
+
+<g font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif" font-size="14.5">
+<rect x="42" y="112" width="176" height="46" rx="8" fill="#251d28" stroke="#3fb950" stroke-width="1.5"/>
+<rect x="42" y="112" width="176" height="46" rx="8" fill="#58a6ff" opacity="0">
+<animate attributeName="opacity" values="0;0;0.30;0.30;0;0" keyTimes="0;0.030;0.045;0.130;0.145;1" dur="5s" repeatCount="indefinite"/>
+</rect>
+<text x="130" y="141" fill="#e9eff5" text-anchor="middle">1 Preflight</text>
+
+<rect x="230" y="112" width="176" height="46" rx="8" fill="#251d28" stroke="#3fb950" stroke-width="1.5"/>
+<rect x="230" y="112" width="176" height="46" rx="8" fill="#58a6ff" opacity="0">
+<animate attributeName="opacity" values="0;0;0.30;0.30;0;0" keyTimes="0;0.185;0.200;0.285;0.300;1" dur="5s" repeatCount="indefinite"/>
+</rect>
+<text x="318" y="141" fill="#e9eff5" text-anchor="middle">2 Plan</text>
+
+<rect x="418" y="112" width="176" height="46" rx="8" fill="#251d28" stroke="#3fb950" stroke-width="1.5"/>
+<rect x="418" y="112" width="176" height="46" rx="8" fill="#58a6ff" opacity="0">
+<animate attributeName="opacity" values="0;0;0.30;0.30;0;0" keyTimes="0;0.340;0.355;0.440;0.455;1" dur="5s" repeatCount="indefinite"/>
+</rect>
+<text x="506" y="141" fill="#e9eff5" text-anchor="middle">3 Drain</text>
+
+<rect x="606" y="112" width="176" height="46" rx="8" fill="#251d28" stroke="#3fb950" stroke-width="1.5"/>
+<rect x="606" y="112" width="176" height="46" rx="8" fill="#58a6ff" opacity="0">
+<animate attributeName="opacity" values="0;0;0.30;0.30;0;0" keyTimes="0;0.495;0.510;0.595;0.610;1" dur="5s" repeatCount="indefinite"/>
+</rect>
+<text x="694" y="141" fill="#e9eff5" text-anchor="middle">4 Back up</text>
+
+<rect x="794" y="112" width="176" height="46" rx="8" fill="#251d28" stroke="#3fb950" stroke-width="1.5"/>
+<rect x="794" y="112" width="176" height="46" rx="8" fill="#58a6ff" opacity="0">
+<animate attributeName="opacity" values="0;0;0.30;0.30;0;0" keyTimes="0;0.650;0.665;0.750;0.765;1" dur="5s" repeatCount="indefinite"/>
+</rect>
+<text x="882" y="141" fill="#e9eff5" text-anchor="middle">5 Rotate</text>
+
+<rect x="982" y="112" width="176" height="46" rx="8" fill="#251d28" stroke="#f85149" stroke-width="1.5"/>
+<rect x="982" y="112" width="176" height="46" rx="8" fill="#f85149" opacity="0">
+<animate attributeName="opacity" values="0;0;0.32;0.32;0;0" keyTimes="0;0.805;0.820;0.905;0.920;1" dur="5s" repeatCount="indefinite"/>
+</rect>
+<text x="1060" y="141" fill="#e9eff5" text-anchor="middle">6 Verify</text>
+<path d="M1130,134 L1142,146 M1142,134 L1130,146" stroke="#f85149" stroke-width="2.6" stroke-linecap="round" fill="none"/>
+</g>
+
+<rect x="50" y="292" width="252" height="152" rx="12" fill="#251d28" stroke="#3a3040" stroke-width="1.5"/>
+<text x="70" y="320" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,Arial,sans-serif" font-size="11.5" letter-spacing="1.4" fill="#828c98" font-weight="700">KUBERNETES SECRET</text>
+<text x="70" y="348" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="16.5" font-weight="600" fill="#e9eff5">slurm-auth-slurm</text>
+<text x="70" y="372" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" fill="#f5b544">immutable: true</text>
+<line x1="70" y1="388" x2="282" y2="388" stroke="#3a3040" stroke-width="1"/>
+<text x="70" y="410" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#828c98">slurm.key (new)</text>
+<text x="70" y="431" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13.5" font-weight="600" fill="#3fb950">sha c5016281...</text>
+
+<path d="M302,338 H346 V262 H352" fill="none" stroke="#3a3040" stroke-width="2"/>
+<line x1="352" y1="262" x2="742" y2="262" stroke="#2e2433" stroke-width="2" stroke-dasharray="5 5"/>
+<polygon points="740,256 752,262 740,268" fill="#58a6ff"/>
+<text x="547" y="248" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,Arial,sans-serif" font-size="12.5" fill="#828c98" text-anchor="middle">projected volume - adopts on restart</text>
+<circle r="4.5" cx="352" cy="262" fill="#58a6ff" opacity="0">
+<animate attributeName="cx" values="352;742" dur="2.4s" repeatCount="indefinite" begin="0s"/>
+<animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.10;0.88;1" dur="2.4s" repeatCount="indefinite" begin="0s"/>
+</circle>
+<circle r="4.5" cx="352" cy="262" fill="#58a6ff" opacity="0">
+<animate attributeName="cx" values="352;742" dur="2.4s" repeatCount="indefinite" begin="0.8s"/>
+<animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.10;0.88;1" dur="2.4s" repeatCount="indefinite" begin="0.8s"/>
+</circle>
+<circle r="4.5" cx="352" cy="262" fill="#58a6ff" opacity="0">
+<animate attributeName="cx" values="352;742" dur="2.4s" repeatCount="indefinite" begin="1.6s"/>
+<animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.10;0.88;1" dur="2.4s" repeatCount="indefinite" begin="1.6s"/>
+</circle>
+
+<rect x="748" y="212" width="312" height="100" rx="12" fill="#251d28" stroke="#58a6ff" stroke-width="1.5"/>
+<text x="770" y="243" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="17" font-weight="600" fill="#e9eff5">slurmctld</text>
+<text x="770" y="265" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,Arial,sans-serif" font-size="12.5" fill="#828c98">StatefulSet - rollout restart reaches it</text>
+<text x="770" y="293" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13.5" font-weight="600" fill="#3fb950">sha c5016281...</text>
+<path d="M1028,288 l5,6 l11,-14" stroke="#3fb950" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+
+<path d="M302,398 H346 V478 H352" fill="none" stroke="#3a3040" stroke-width="2"/>
+<line x1="352" y1="478" x2="446" y2="478" stroke="#2e2433" stroke-width="2" stroke-dasharray="5 5"/>
+<polygon points="444,472 456,478 444,484" fill="#f5b544"/>
+<circle r="4.5" cx="352" cy="478" fill="#f5b544" opacity="0">
+<animate attributeName="cx" values="352;446" dur="1.1s" repeatCount="indefinite" begin="0s"/>
+<animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.15;0.85;1" dur="1.1s" repeatCount="indefinite" begin="0s"/>
+</circle>
+<circle r="4.5" cx="352" cy="478" fill="#f5b544" opacity="0">
+<animate attributeName="cx" values="352;446" dur="1.1s" repeatCount="indefinite" begin="0.55s"/>
+<animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.15;0.85;1" dur="1.1s" repeatCount="indefinite" begin="0.55s"/>
+</circle>
+
+<rect x="452" y="430" width="200" height="96" rx="12" fill="#2e2433" stroke="#f5b544" stroke-width="1.5" stroke-dasharray="6 4"/>
+<text x="470" y="461" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,Arial,sans-serif" font-size="14.5" font-weight="700" fill="#f5b544">kubelet cache</text>
+<text x="470" y="483" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,Arial,sans-serif" font-size="11.5" fill="#adb8c4">keeps serving the node's</text>
+<text x="470" y="500" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,Arial,sans-serif" font-size="11.5" fill="#adb8c4">cached copy to new pods</text>
+
+<line x1="652" y1="478" x2="742" y2="478" stroke="#2e2433" stroke-width="2" stroke-dasharray="5 5"/>
+<polygon points="740,472 752,478 740,484" fill="#f85149"/>
+<circle r="4.5" cx="652" cy="478" fill="#f85149" opacity="0">
+<animate attributeName="cx" values="652;742" dur="1.1s" repeatCount="indefinite" begin="0.2s"/>
+<animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.15;0.85;1" dur="1.1s" repeatCount="indefinite" begin="0.2s"/>
+</circle>
+<circle r="4.5" cx="652" cy="478" fill="#f85149" opacity="0">
+<animate attributeName="cx" values="652;742" dur="1.1s" repeatCount="indefinite" begin="0.75s"/>
+<animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.15;0.85;1" dur="1.1s" repeatCount="indefinite" begin="0.75s"/>
+</circle>
+
+<rect x="748" y="428" width="312" height="100" rx="12" fill="#251d28" stroke="#f85149" stroke-width="1.5"/>
+<text x="770" y="459" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="17" font-weight="600" fill="#e9eff5">slurmd</text>
+<text x="770" y="481" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,Arial,sans-serif" font-size="12.5" fill="#828c98">NodeSet CRD - rollout restart skips it</text>
+<text x="770" y="509" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13.5" font-weight="600" fill="#f85149">sha 8cbda076...</text>
+<path d="M1029,499 L1043,513 M1043,499 L1029,513" stroke="#f85149" stroke-width="2.8" stroke-linecap="round" fill="none"/>
+
+<line x1="904" y1="312" x2="904" y2="428" stroke="#f85149" stroke-width="2.5" stroke-dasharray="7 5">
+<animate attributeName="opacity" values="1;0.25;1" dur="1.6s" repeatCount="indefinite"/>
+</line>
+<circle cx="904" cy="370" r="17" fill="#1a1520" stroke="#f85149" stroke-width="2">
+<animate attributeName="opacity" values="1;0.45;1" dur="1.6s" repeatCount="indefinite"/>
+</circle>
+<path d="M897,363 L911,377 M911,363 L897,377" stroke="#f85149" stroke-width="2.6" stroke-linecap="round" fill="none"/>
+<text x="932" y="366" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,Arial,sans-serif" font-size="13" font-weight="700" fill="#f85149">trust boundary broken</text>
+<text x="932" y="384" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#828c98">Protocol authentication error</text>
+
+<rect x="50" y="576" width="1100" height="120" rx="12" fill="#251d28" stroke="#3a3040" stroke-width="1.5"/>
+<rect x="50" y="576" width="5" height="120" fill="#58a6ff"/>
+<text x="78" y="607" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,Arial,sans-serif" font-size="11.5" letter-spacing="1.5" font-weight="700" fill="#58a6ff">WHAT THE SCRIPT DOES ABOUT IT</text>
+<text x="78" y="635" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,Arial,sans-serif" font-size="15" fill="#e9eff5">Reads sha256 of slurm.key off disk inside every slurmd pod and compares it to the Secret.</text>
+<text x="78" y="659" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,Arial,sans-serif" font-size="15" fill="#e9eff5">On mismatch: the drain is lifted, the previous key is restored, and it exits non-zero.</text>
+<text x="78" y="684" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,Arial,sans-serif" font-size="13.5" font-style="italic" fill="#828c98">A check that does not cross the boundary you might have broken will pass no matter what you broke.</text>
+</svg>

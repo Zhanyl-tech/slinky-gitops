@@ -42,6 +42,13 @@ a 25.11 upgrade — the Kubernetes path is already a release ahead.
 
 ## The thing this repo is actually for
 
+![Rotating auth/slurm on Slinky: the Secret holds the new key, slurmctld adopts it, and the kubelet serves slurmd a stale cached copy, so the controller-to-slurmd trust boundary breaks and the rotation rolls back](docs/auth-rotation.svg)
+
+<sub>The six steps run left to right. Five succeed. The Secret carries the new key and
+`slurmctld` adopts it, but a newly created `slurmd` pod is served the node's cached copy
+— so the two daemons hold different keys and cannot authenticate to each other. The
+script measures that rather than inferring it, and rolls back.</sub>
+
 ### Every MUNGE rotation guide is describing a component that isn't installed
 
 Search for "rotate Slurm shared secret" and you get MUNGE. On a current Slinky
