@@ -1,6 +1,6 @@
 <svg width="1200" height="730" viewBox="0 0 1200 730" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="ttl dsc">
 <title id="ttl">Rotating auth/slurm on Slinky: where the key stops propagating</title>
-<desc id="dsc">The Kubernetes Secret holds the new key. slurmctld adopts it. slurmd is served a stale cached copy by the kubelet, so the controller-to-slurmd trust boundary breaks and the rotation is rolled back.</desc>
+<desc id="dsc">The Kubernetes Secret holds the new key. slurmctld adopts it. A new slurmd pod comes up with the previous key, most likely the kubelet's cached copy (a hypothesis, see the README), so the controller-to-slurmd trust boundary breaks and the rotation is rolled back.</desc>
 
 <rect width="1200" height="730" fill="#1a1520"/>
 
@@ -93,7 +93,7 @@
 
 <rect x="452" y="430" width="200" height="96" rx="12" fill="#2e2433" stroke="#f5b544" stroke-width="1.5" stroke-dasharray="6 4"/>
 <text x="470" y="461" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,Arial,sans-serif" font-size="14.5" font-weight="700" fill="#f5b544">kubelet cache</text>
-<text x="470" y="483" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,Arial,sans-serif" font-size="11.5" fill="#adb8c4">keeps serving the node's</text>
+<text x="470" y="483" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,Arial,sans-serif" font-size="11.5" fill="#adb8c4">likely serves the node's</text>
 <text x="470" y="500" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,Arial,sans-serif" font-size="11.5" fill="#adb8c4">cached copy to new pods</text>
 
 <line x1="652" y1="478" x2="742" y2="478" stroke="#2e2433" stroke-width="2" stroke-dasharray="5 5"/>
@@ -127,6 +127,6 @@
 <rect x="50" y="576" width="5" height="120" fill="#58a6ff"/>
 <text x="78" y="607" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,Arial,sans-serif" font-size="11.5" letter-spacing="1.5" font-weight="700" fill="#58a6ff">WHAT THE SCRIPT DOES ABOUT IT</text>
 <text x="78" y="635" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,Arial,sans-serif" font-size="15" fill="#e9eff5">Reads sha256 of slurm.key off disk inside every slurmd pod and compares it to the Secret.</text>
-<text x="78" y="659" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,Arial,sans-serif" font-size="15" fill="#e9eff5">On mismatch: the drain is lifted, the previous key is restored, and it exits non-zero.</text>
+<text x="78" y="659" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,Arial,sans-serif" font-size="15" fill="#e9eff5">On mismatch: the previous key is restored and verified, the drain is lifted, and it exits 3.</text>
 <text x="78" y="684" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,Arial,sans-serif" font-size="13.5" font-style="italic" fill="#828c98">A check that does not cross the boundary you might have broken will pass no matter what you broke.</text>
 </svg>

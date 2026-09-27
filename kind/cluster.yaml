@@ -1,5 +1,17 @@
-# Three nodes so nodesets actually schedule across workers rather than
-# co-locating on a single node and hiding placement bugs.
+# Local topology for `make up`: one control plane and two workers.
+#
+# The node image is pinned by KIND_NODE_IMAGE in the Makefile and passed as
+# `kind create cluster --image`, which kind applies to every node listed here.
+#
+# Two workers let the controller, the REST API and slurmd land on different
+# kubelets. That placement is not neutral for this repo: the best explanation
+# of the rotation failure is the kubelet's per-node Secret cache (README, "The
+# part I could not fix"), so whether slurmd shares a kubelet with another pod
+# mounting slurm-auth-slurm may decide the outcome. `make status`, CI's
+# "Record what this run tested" step and the rotation script's rollback all
+# print `kubectl get pods -o wide`, so the placement is on record. (An earlier
+# comment said three nodes "hide placement bugs"; with one slurmd replica that
+# was never tested.)
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 name: slinky

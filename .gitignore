@@ -1,3 +1,8 @@
 .DS_Store
 *.log
 kubeconfig
+# CI and local tool output
+.ci-venv/
+diagnostics/
+before/
+__pycache__/

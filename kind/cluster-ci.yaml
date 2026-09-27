@@ -1,6 +1,27 @@
-# Smaller topology for CI. A GitHub runner is 2 vCPU / 7 GB; three KinD nodes
-# plus cert-manager plus the operator leaves the slurmd pod nothing to schedule
-# into, which is what hung the first CI run.
+# CI topology: one control plane and ONE worker.
+#
+# The node image is pinned by KIND_NODE_IMAGE in the Makefile (passed as
+# `kind create cluster --image`, applied to every node).
+#
+# Why a single worker. The original justification here was that "a GitHub
+# runner is 2 vCPU / 7 GB" and three KinD nodes starved slurmd, "which is what
+# hung the first CI run". The Actions record does not support that: in run
+# 30222807733, which used the three-node kind/cluster.yaml, "Deploy Slurm"
+# succeeded in 71 s and the hang was the post-rotation `srun` (README, "What
+# CI caught"); and GitHub documents 4 vCPU / 16 GB for Linux runners on public
+# repositories (2 / 8 GB on private ones).
+#
+# It is kept for a different reason: with one worker, the controller, the
+# REST API and slurmd share a kubelet, which is the placement under which the
+# kubelet-cache hypothesis predicts the stale key. In all four runs since the
+# propagation check was added (commits 8d22ade, 8e742be, 044e01c, c51903a) the
+# rotation step exited non-zero after 369, 404, 410 and 419 s, consistent with
+# the 300 s propagation wait plus a rollback. At those commits the step passed
+# on any non-zero exit and the logs were not re-read, so which check fired is
+# not confirmed. With two workers the
+# outcome may depend on where the scheduler puts pods, and CI asserts one
+# outcome. That is a hypothesis, not a controlled experiment; CI now records
+# `-o wide` placement and asserts the exact failure message.
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 name: slinky

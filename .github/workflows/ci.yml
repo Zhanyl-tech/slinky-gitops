@@ -4,47 +4,171 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Weekly drift check. Every version is pinned (Makefile), so nothing upstream
+  # changes a normal run; this is where upstream changes show up instead: the
+  # pinned track catches things like a pulled image, the latest track runs the
+  # newest Slinky, cert-manager and kind, and fails loudly if the rotation
+  # starts to succeed (or fails differently) there.
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
-  # The README promises `make up` works. Prove it on every push, against a real
-  # KinD cluster, rather than trusting that it still does.
-  bring-up:
+  lint:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: helm/kind-action@v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Pinned tools
+        run: |
+          python3 -m venv .ci-venv
+          .ci-venv/bin/pip install --quiet shellcheck-py==0.11.0.1 pyyaml==6.0.3
+      - name: bash -n and shellcheck on every shell script
+        run: make lint SHELLCHECK=.ci-venv/bin/shellcheck
+      - name: Python helpers compile
+        run: .ci-venv/bin/python -m py_compile scripts/lib/authkey.py scripts/ci/*.py tests/fake/*.py
+      - name: Every YAML file parses
+        run: .ci-venv/bin/python scripts/ci/check-yaml.py .
+
+  # The rotation script against a fake kubectl: every failure path the KinD job
+  # cannot reach (drain timeout, API errors mid-replacement, interrupted runs,
+  # pre-drained nodes, unreadable pods, jwt scoping), without a cluster.
+  offline-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: make test
+
+  # values/slurm.yaml rendered by the pinned chart and validated against the
+  # Kubernetes schemas and the pinned Slinky CRDs, without a cluster.
+  manifests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
-          config: kind/cluster-ci.yaml
+          version: v3.19.0
+      - name: kubeconform v0.8.0 (checksum from the release's CHECKSUMS file)
+        run: |
+          curl -fsSLo kubeconform.tgz \
+            https://github.com/yannh/kubeconform/releases/download/v0.8.0/kubeconform-linux-amd64.tar.gz
+          echo "9bc2bffbf71f261128533edaf912153948b7ff238f9a531ae6d34466ec287883  kubeconform.tgz" | sha256sum -c
+          tar xzf kubeconform.tgz kubeconform
+      - name: Render and validate
+        run: |
+          python3 -m venv .ci-venv
+          .ci-venv/bin/pip install --quiet pyyaml==6.0.3
+          KUBECONFORM=./kubeconform PYTHON=.ci-venv/bin/python scripts/ci/validate-manifests.sh
+
+  # The README promises `make up` works and says exactly what the rotation
+  # does on this version. Prove both on every push, against a real KinD
+  # cluster, rather than trusting that they still hold.
+  bring-up:
+    needs: [lint, offline-tests, manifests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        track: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["pinned", "latest"]' || '["pinned"]') }}
+    env:
+      # Empty pins make the Makefile install the newest release of each.
+      PINS: ${{ matrix.track == 'latest' && 'SLINKY_VERSION= CERT_MANAGER_VERSION= KIND_NODE_IMAGE=' || '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.19.0
+      # kind v0.27.0 is the release the pinned node image was published with;
+      # kubectl matches the node's Kubernetes version. Empty on the latest
+      # track, which makes the action use its defaults. install_only: the
+      # cluster is created by `make cluster`, so the Makefile stays the one
+      # place the node image is pinned; cluster_name is for the post-step
+      # cleanup.
+      - uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
+        with:
+          install_only: true
           cluster_name: slinky
+          version: ${{ matrix.track == 'pinned' && 'v0.27.0' || '' }}
+          kubectl_version: ${{ matrix.track == 'pinned' && 'v1.32.2' || '' }}
+      - name: Create the KinD cluster
+        run: |
+          # shellcheck disable=SC2086  # PINS is empty or several VAR= words, split on purpose
+          make cluster KIND_CONFIG=kind/cluster-ci.yaml $PINS
       - name: Install operator
-        run: make operator
+        run: |
+          # shellcheck disable=SC2086  # PINS is empty or several VAR= words, split on purpose
+          make operator $PINS
       - name: Deploy Slurm
-        run: make slurm
+        run: |
+          # shellcheck disable=SC2086  # PINS is empty or several VAR= words, split on purpose
+          make slurm $PINS
+      - name: Record what this run tested
+        run: |
+          make versions
+          kubectl get pods -A -o wide
+
       - name: Run a job
         run: make job
 
       # On Slinky v1.2 the in-place rotation does not propagate: a slurmd pod
-      # created after the Secret is replaced still mounts the previous key.
-      # See README "What CI caught". Until that is solved, the property worth
-      # testing is not that rotation succeeds — it is that a rotation which
-      # cannot work refuses to report success, rolls back, and leaves a cluster
-      # that still runs jobs. A silent green tick here is the actual hazard.
-      - name: Rotation refuses to lie and rolls back
+      # created after the Secret is replaced still mounts the previous key
+      # (README, "What CI caught"). Until that is solved, the property worth
+      # testing is not that rotation succeeds; it is that a rotation which
+      # cannot work says exactly why, restores the previous key, verifies it,
+      # and leaves the Secret as it was. scripts/ci/assert-rotation.sh spells
+      # out each condition. The script is called directly because make turns
+      # every failing exit code into 2.
+      - name: Rotation fails for the documented reason and rolls back
         run: |
-          if make rotate; then
-            echo "::error::make rotate reported success; propagation is known to fail on this version."
-            echo "If this is now genuinely fixed, update the README and make this step expect success."
-            exit 1
-          fi
-          echo "rotation failed and rolled back, as expected"
+          scripts/ci/assert-rotation.sh record before
+          set +e
+          ./scripts/rotate-auth-key.sh -n slurm 2>&1 | tee rotate.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          scripts/ci/assert-rotation.sh expect-rolled-back "$rc" rotate.log before
 
-      - name: Cluster still runs a job after the rollback
+      - name: Cluster still runs a job after the automatic rollback
         run: make job
 
-  shellcheck:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y shellcheck
-      - run: shellcheck -S warning scripts/*.sh
+      # `make rollback` used to restart only the built-in workloads and exit 0
+      # without cycling slurmd or checking anything. Exercise the real path:
+      # drain, restore, cycle slurmd, measure, resume, retire the backup.
+      - name: Manual rollback cycles slurmd, verifies, and retires the backup
+        run: |
+          set +e
+          ./scripts/rotate-auth-key.sh -n slurm --rollback 2>&1 | tee rollback.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          scripts/ci/assert-rotation.sh expect-restored "$rc" rollback.log before
+
+      - name: Cluster runs a job after the manual rollback
+        run: make job
+
+      # Last, because a jwt.key change can leave the operator's own REST token
+      # stale for up to ~12 minutes (README); nothing after this depends on it.
+      - name: jwt.key rotation also fails for the documented reason and restores both keys
+        run: |
+          set +e
+          ./scripts/rotate-auth-key.sh -n slurm --jwt 2>&1 | tee rotate-jwt.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          scripts/ci/assert-rotation.sh expect-rolled-back "$rc" rotate-jwt.log before
+
+      - name: Cluster runs a job after the jwt rollback
+        run: make job
+
+      - name: Collect diagnostics
+        if: failure()
+        run: scripts/ci/collect-diagnostics.sh diagnostics
+      - name: Upload diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: diagnostics-${{ matrix.track }}
+          path: |
+            diagnostics/
+            *.log
+          retention-days: 14

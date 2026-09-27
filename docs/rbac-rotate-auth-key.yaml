@@ -1,0 +1,52 @@
+# What scripts/rotate-auth-key.sh needs, as a namespaced Role.
+#
+# Derived from the kubectl calls the script makes (get/create/delete secret,
+# get/delete/exec/wait on pods, rollout restart/status, get nodesets); nothing
+# cluster-scoped. `make test` checks the Secrets rule against the calls the
+# script makes on the fake cluster (test rbac_role_covers_the_secret_calls in
+# tests/run.sh). NOT tested against an RBAC-restricted account. `make rotate-dry` with
+# it is not enough, because a dry run never deletes, creates or execs
+# anything: test it with a real `make rotate` and `make rollback` on a
+# disposable cluster (e.g. `make up`) before relying on it, and expect to
+# adjust.
+#
+# Bind it to whoever runs the rotation, in the Slurm cluster's namespace only.
+# It can read and replace the auth Secrets, which is the point, so treat the
+# binding like the keys themselves.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: rotate-auth-key
+  namespace: slurm
+rules:
+  # The auth Secrets, their -previous backups and -next staging copies. There
+  # is no update/patch: the chart's Secrets are immutable, so the script only
+  # ever deletes and recreates them. list and watch are for `kubectl delete
+  # --wait`, which the script uses on the live Secret: kubectl GETs the object
+  # and, while the orphan finalizer still holds it, lists and watches it until
+  # it is gone (IsDeleted in staging/src/k8s.io/kubectl/pkg/cmd/wait/delete.go
+  # at v1.32.2, read in source). How kubectl behaves without them was not
+  # measured; the script bounds that wait with --timeout either way.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  # Find the controller and slurmd pods, replace slurmd, wait for readiness.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "delete"]
+  # sha256sum, sinfo, squeue and scontrol inside slurmctld and slurmd. Exec
+  # over the WebSocket transport starts as an HTTP GET and was authorized as
+  # `get` before Kubernetes 1.35 (kubernetes/kubernetes#78741); from 1.35 the
+  # API server also requires `create` for the upgrade. Both are listed so the
+  # Role works on the pinned v1.32.2 and on newer clusters.
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["get", "create"]
+  # `kubectl rollout restart` patches the pod template; `rollout status` watches.
+  - apiGroups: ["apps"]
+    resources: ["statefulsets", "deployments", "daemonsets"]
+    verbs: ["get", "list", "watch", "patch"]
+  # Preflight: every NodeSet converged.
+  - apiGroups: ["slinky.slurm.net"]
+    resources: ["nodesets"]
+    verbs: ["get", "list"]

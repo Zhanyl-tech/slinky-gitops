@@ -3,7 +3,9 @@
 nodesets:
   slinky:
     # One replica is enough on KinD; a real cluster scales this or adds
-    # nodesets per hardware class (see docs/autoscaling.md).
+    # nodesets per hardware class (not built here; see README "Honest scope").
+    # CI renders this file with the pinned chart and validates the result
+    # against the Slinky CRDs (scripts/ci/validate-manifests.sh).
     replicas: 1
 
 partitions:
