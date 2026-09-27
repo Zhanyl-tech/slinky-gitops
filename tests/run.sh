@@ -408,6 +408,179 @@ test_operator_drain_reason_is_not_resumed() {
   check "leaves the operator's reason to the operator" lacks "$d/scontrol.log" "Reason=slurm-operator"
 }
 
+# ── The operator's undrain after a pod replacement ───────────────────────────
+#
+# On KinD with slurm-operator v1.2.0, replacing a slurmd pod ends with the
+# operator undraining the node itself, reason "slurm-operator: Pod
+# (slurm/<pod>) was uncordoned" (FAKE_OPERATOR=1 models it). Before this was
+# understood, the rollback took that for someone else's drain and exited 4.
+
+test_operator_undrain_of_our_replacement_is_ours() {
+  # (a) The CI failure: one node, the key does not take, and the rollback's
+  # re-read finds the operator's reason on the node this run drained, naming
+  # the pod this run replaced there.
+  local d A="$ROOT/scripts/ci/assert-rotation.sh"
+  local r0="slurm-operator: Pod (slurm/slurm-worker-slinky-0) was uncordoned"
+  d=$(new_cluster op-stale --node=slinky-0=idle)
+  FAKE_STATE="$d" "$A" record "$d/rec" >/dev/null 2>&1
+  FAKE_OPERATOR=1 FAKE_SLURMD_STALE=1 run_script "$d" --timeout 2
+  check "exit 3, as documented" eq "$RC" 3
+  check "the operator did undrain it" contains "$d/events.log" "OPERATOR-UNDRAIN slinky-0 $r0"
+  check "not taken for someone else's drain" lacks "$OUTPUT" "drained by someone else"
+  check "verified on the previous key" contains "$OUTPUT" "every node this run drained is schedulable again: slinky-0"
+  check "slinky-0 resumed" grep -q '^RESUME slinky-0 ' "$d/events.log"
+  check "slinky-0 in service" eq "$(state node "$d" slinky-0)" "idle|"
+  FAKE_STATE="$d" "$A" expect-rolled-back "$RC" "$OUTPUT" "$d/rec" >"$d/a1" 2>&1
+  check "the CI assertion passes" eq "$?" 0
+
+  # The next CI step, a manual --rollback: its own pod replacement is followed
+  # by the same undrain, which the resume loop meets this time.
+  FAKE_OPERATOR=1 FAKE_SLURMD_STALE=1 run_script "$d" --rollback --timeout 3
+  check "manual rollback: exit 0" eq "$RC" 0
+  check "manual rollback: resumed from the operator's reason" contains "$d/events.log" "RESUME slinky-0 reason=$r0"
+  check "manual rollback: slinky-0 in service" eq "$(state node "$d" slinky-0)" "idle|"
+  FAKE_STATE="$d" "$A" expect-restored "$RC" "$OUTPUT" "$d/rec" >"$d/a2" 2>&1
+  check "manual rollback: the CI assertion passes" eq "$?" 0
+
+  # And when the key does take.
+  d=$(new_cluster op-happy)
+  FAKE_OPERATOR=1 run_script "$d" --timeout 3
+  check "key takes: exit 0" eq "$RC" 0
+  check "key takes: reports completion" contains "$OUTPUT" "Rotation complete."
+  check "key takes: both back in service" eq "$(state node "$d" slinky-0)|$(state node "$d" slinky-1)" "idle||idle|"
+
+  # DaemonSet mode: the replacement pod has a new name, and that is the pod
+  # the operator names.
+  d=$(new_cluster op-daemonset --daemonset --node=slinky-0=idle)
+  FAKE_OPERATOR=1 FAKE_SLURMD_STALE=1 run_script "$d" --timeout 2
+  check "DaemonSet mode: exit 3" eq "$RC" 3
+  check "DaemonSet mode: the operator named the replacement" \
+    grep -q '^OPERATOR-UNDRAIN slinky-0 slurm-operator: Pod (slurm/slurm-worker-slinky-x[0-9]*) was uncordoned$' "$d/events.log"
+  check "DaemonSet mode: slinky-0 in service" eq "$(state node "$d" slinky-0)" "idle|"
+}
+
+# someone_elses_reason NAME REASON: REASON is put on slinky-0 right after the
+# first pod replacement of a rotation whose key does not take, which is where
+# the CI run met the operator's undrain. It is not the operator's undrain of
+# a pod this run replaced on slinky-0, so slinky-0 is handed over: named,
+# never resumed, left out of service, exit 4. slinky-1 is still verified.
+someone_elses_reason() {
+  local d; d=$(new_cluster "$1")
+  FAKE_SLURMD_STALE=1 FAKE_EXTERNAL_DRAIN="slinky-0:$2" run_script "$d" --timeout 2
+  check "[$2] exit 4" eq "$RC" 4
+  check "[$2] handed over" contains "$OUTPUT" "slinky-0 was drained by someone else during the run ($2)"
+  check "[$2] never resumed after it was set" no_resume_after_external_drain "$d" slinky-0
+  check "[$2] left out of service" test "$(state node "$d" slinky-0 | cut -d'|' -f1)" != idle
+  check "[$2] slinky-1 verified on the previous key" \
+    contains "$OUTPUT" "every node this run drained is schedulable again: slinky-1"
+}
+
+test_operator_undrain_of_a_pod_we_did_not_replace_is_someone_elses() {
+  # (b) The operator's message, but not for the pod this run replaced on
+  # slinky-0: slinky-1's pod (replaced by this run, on another node), a pod
+  # that does not exist, and the right pod name in another namespace.
+  someone_elses_reason op-other-node "slurm-operator: Pod (slurm/slurm-worker-slinky-1) was uncordoned"
+  someone_elses_reason op-no-such-pod "slurm-operator: Pod (slurm/slurm-worker-slinky-7) was uncordoned"
+  someone_elses_reason op-other-ns "slurm-operator: Pod (other/slurm-worker-slinky-0) was uncordoned"
+}
+
+test_operator_cordon_reasons_are_someone_elses() {
+  # (c) The operator draining for a cordoned pod: someone asked for it. v1.2.0
+  # writes this reason only on a node that had none; on a node with a reason
+  # it keeps that one (next test).
+  someone_elses_reason op-pod-cordon "slurm-operator: Pod (slurm/slurm-worker-slinky-0) was cordoned"
+}
+
+test_a_cordon_after_the_operators_undrain_is_someone_elses() {
+  # The operator's cordon drains (Kubernetes node cordoned, or the pod-cordon
+  # annotation set) keep any reason the node already has (MakeNodeDrain with
+  # overrideReason false, slurmcontrol.go lines 227-231 at v1.2.0). A cordon
+  # that lands after the operator's undrain therefore drains the node again
+  # under exactly the reason this run accepts. The undrain is the write that
+  # cleared the DRAIN flag, so that reason on a node carrying the flag again
+  # is someone else's drain: handed over, never resumed, exit 4.
+  local r0="slurm-operator: Pod (slurm/slurm-worker-slinky-0) was uncordoned" d
+  # The key takes: the resume loop meets it.
+  d=$(new_cluster op-recordon)
+  FAKE_OPERATOR=1 FAKE_EXTERNAL_DRAIN="slinky-0:$r0" run_script "$d" --timeout 3
+  check "[key takes] the operator undrained it first" contains "$d/events.log" "OPERATOR-UNDRAIN slinky-0 $r0"
+  check "[key takes] exit 4" eq "$RC" 4
+  check "[key takes] not reported complete" lacks "$OUTPUT" "Rotation complete."
+  check "[key takes] handed over" contains "$OUTPUT" "slinky-0 was drained by someone else during the run ($r0)"
+  check "[key takes] never resumed after the cordon" no_resume_after_external_drain "$d" slinky-0
+  check "[key takes] still drained" eq "$(state node "$d" slinky-0)" "drain|$r0"
+  check "[key takes] slinky-1 verified on the new key" \
+    contains "$OUTPUT" "every node this run drained is schedulable again: slinky-1"
+  # The key does not take: the rollback's re-read, before its own pod
+  # replacement, meets it.
+  FAKE_OPERATOR=1 someone_elses_reason op-recordon-stale "$r0"
+}
+
+test_admin_reason_after_replacement_is_someone_elses() {
+  # (d) An admin's drain, with the operator running: the next pod replacement
+  # rewrites slinky-0's reason to the preStop one and the operator then
+  # writes exactly the undrain this run would accept on a node it still
+  # held. Handed over is handed over: slinky-0 is never taken back, and the
+  # admin's reason is put back.
+  local r="replace DIMM B2 (ops ticket 4411)"
+  FAKE_OPERATOR=1 someone_elses_reason op-admin "$r"
+  local d="$WORK/op-admin"
+  check "the operator did rewrite it" \
+    contains "$d/events.log" "OPERATOR-UNDRAIN slinky-0 slurm-operator: Pod (slurm/slurm-worker-slinky-0) was uncordoned"
+  check "the admin's reason is back" eq "$(state node "$d" slinky-0)" "drain|$r"
+
+  # A node drained before the run is never this run's, whatever the operator
+  # writes on it after its pod is replaced.
+  d=$(new_cluster op-predrain --node=slinky-0=idle "--node=slinky-1=drain:GPU XID 79 (health check)")
+  FAKE_OPERATOR=1 FAKE_SLURMD_STALE=1 run_script "$d" --timeout 2 --allow-degraded
+  check "pre-drained: exit 3" eq "$RC" 3
+  check "pre-drained: the operator did undrain slinky-1" \
+    contains "$d/events.log" "OPERATOR-UNDRAIN slinky-1 slurm-operator: Pod (slurm/slurm-worker-slinky-1) was uncordoned"
+  check "pre-drained: slinky-1 never resumed" no_resume_of "$d" slinky-1
+  check "pre-drained: slinky-1 keeps its reason" eq "$(state node "$d" slinky-1)" "drain|GPU XID 79 (health check)"
+  check "pre-drained: slinky-0 in service" eq "$(state node "$d" slinky-0)" "idle|"
+}
+
+test_operator_undrain_lookalikes_are_someone_elses() {
+  # (e) Matched as a whole string, not a pattern. The last one turns into the
+  # real reason if it goes through `awk -v`, which processes escapes.
+  local r d i=0
+  for r in \
+    "x slurm-operator: Pod (slurm/slurm-worker-slinky-0) was uncordoned" \
+    "slurm-operator: Pod (slurm/slurm-worker-slinky-0) was uncordoned; GPU XID 79 (epilog)" \
+    "Pod (slurm/slurm-worker-slinky-0) was uncordoned" \
+    "slurm-operator: Pod (slurm/slurm-worker-slinky-0x) was uncordoned" \
+    'slurm-operator: Pod (slurm/slurm-worker-slinky-0) was uncordone\d'
+  do
+    i=$((i + 1)); d=$(new_cluster "op-lookalike-$i")
+    # The key takes: the resume loop, not the rollback's re-read, judges it.
+    FAKE_EXTERNAL_DRAIN="slinky-0:$r" run_script "$d" --timeout 2
+    check "[$r] exit 4" eq "$RC" 4
+    check "[$r] handed over" contains "$OUTPUT" "slinky-0 was drained by someone else during the run ($r)"
+    check "[$r] never resumed" no_resume_after_external_drain "$d" slinky-0
+    check "[$r] keeps the reason" eq "$(state node "$d" slinky-0)" "drain|$r"
+  done
+  # The same through the rollback's re-read, as in CI.
+  someone_elses_reason op-lookalike-stale "slurm-operator: Pod (slurm/slurm-worker-slinky-0) was uncordoned (and drained by ops)"
+}
+
+test_slurmd_pods_map_to_slurm_nodes_like_the_operator() {
+  # GetSlurmNodeName (internal/controller/nodeset/utils/utils.go at v1.2.0).
+  local A="$ROOT/scripts/lib/authkey.py" out
+  out=$(printf '%s' '{"items":[
+    {"metadata":{"name":"slurm-worker-slinky-0","namespace":"slurm","uid":"u0","labels":{"nodeset.slinky.slurm.net/scaling-mode":"StatefulSet"}},"spec":{"hostname":"slinky-0","nodeName":"kind-worker"}},
+    {"metadata":{"name":"slurm-worker-slinky-1","namespace":"slurm","uid":"u1","labels":{"nodeset.slinky.slurm.net/scaling-mode":"StatefulSet"}},"spec":{"nodeName":"kind-worker"}},
+    {"metadata":{"name":"slurm-worker-slinky-2","namespace":"slurm","uid":"u2","labels":{"nodeset.slinky.slurm.net/scaling-mode":"StatefulSet"}},"spec":{"hostNetwork":true,"hostname":"slinky-2","nodeName":"gpu-7"}},
+    {"metadata":{"name":"slurm-worker-gpu-x7k2p","namespace":"slurm","uid":"u3","labels":{"nodeset.slinky.slurm.net/scaling-mode":"DaemonSet"}},"spec":{"hostname":"gpu-8","nodeName":"gpu-8.example.org"}},
+    {"metadata":{"name":"slurm-worker-gpu-q9z","namespace":"slurm","uid":"u4","labels":{"nodeset.slinky.slurm.net/scaling-mode":"DaemonSet"}},"spec":{"nodeName":"gpu-9"}}
+  ]}' | "$PYTHON" "$A" slurmd-nodes | tr '\t' ' ')
+  check "StatefulSet: the Kubernetes node if hostNetwork, else hostname, else pod name; DaemonSet: hostname only" \
+    eq "$out" "slurm/slurm-worker-slinky-0 u0 slinky-0
+slurm/slurm-worker-slinky-1 u1 slurm-worker-slinky-1
+slurm/slurm-worker-slinky-2 u2 gpu-7
+slurm/slurm-worker-gpu-x7k2p u3 gpu-8"
+}
+
 test_drain_timeout_stops_before_touching_keys() {
   local d; d=$(new_cluster busy)
   local before; before=$(state fingerprint "$d" slurm-auth-slurm slurm.key)
@@ -752,6 +925,10 @@ for t in \
   unresponsive_node_left_alone_is_not_left_down nodeset_convergence_uses_status_desired \
   external_drain_mid_run_is_respected external_drain_during_the_drain_wait_survives_the_rotation \
   drain_timeout_leaves_an_external_drain_alone operator_drain_reason_is_not_resumed \
+  operator_undrain_of_our_replacement_is_ours operator_undrain_of_a_pod_we_did_not_replace_is_someone_elses \
+  operator_cordon_reasons_are_someone_elses a_cordon_after_the_operators_undrain_is_someone_elses \
+  admin_reason_after_replacement_is_someone_elses \
+  operator_undrain_lookalikes_are_someone_elses slurmd_pods_map_to_slurm_nodes_like_the_operator \
   drain_timeout_stops_before_touching_keys squeue_failure_is_not_zero_jobs \
   preflight_fails_closed drain_command_failure_changes_nothing \
   create_failure_once_is_retried live_secret_is_never_lost \

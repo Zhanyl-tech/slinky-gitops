@@ -19,6 +19,10 @@ so that a test failing here means the script would misbehave there:
 - Slurm nodes: DRAIN / RESUME with Slurm's state rules. RESUME on a node
   whose slurmd holds a different key from slurmctld leaves it "idle*" (not
   responding), which is what a failed authentication looks like.
+- With FAKE_OPERATOR=1, the operator's reconcile of each replaced pod
+  (syncCordon in internal/controller/nodeset/nodeset_sync.go at v1.2.0):
+  it undrains a node whose reason is its own with reason
+  "slurm-operator: Pod (<ns>/<pod>) was uncordoned", as it did on KinD.
 
 State lives in $FAKE_STATE/state.json. Every invocation's argv is appended to
 $FAKE_STATE/calls.log, so tests can assert what was (never) run, including
@@ -182,6 +186,44 @@ def external_drain(phase):
     log("events.log", "EXTERNAL-DRAIN %s %s" % (node, reason))
 
 
+def operator_sync_cordon(p):
+    """FAKE_OPERATOR=1: the operator reconciling NodeSet pod p after it was
+    replaced -- syncCordon (internal/controller/nodeset/nodeset_sync.go lines
+    456-563 at v1.2.0) for a pod that is not cordoned, on a Kubernetes node
+    that is not cordoned either. It leaves a node alone when the reason is not
+    its own (IsNodeReasonOurs: non-empty and without the "slurm-operator: "
+    prefix) or the node is DOWN and "Not responding"
+    (IsNodeDownForUnresponsive). Otherwise it calls MakeNodeUndrain, which does
+    nothing unless the node carries the DRAIN flag, and then sends UNDRAIN
+    with the prefixed reason (slurmcontrol.go). Slurm sets the reason and
+    clears only the DRAIN flag; a DOWN node stays DOWN (update_node in
+    src/slurmctld/node_mgr.c)."""
+    n = st["nodes"][p["node"]]
+    if n["reason"] and not n["reason"].startswith("slurm-operator: "):
+        return
+    if n["state"] == "down" and "Not responding" in n["reason"]:
+        return
+    if not n["drain"]:
+        return
+    n["drain"] = False
+    n["reason"] = "slurm-operator: Pod (slurm/%s) was uncordoned" % p["name"]
+    log("events.log", "OPERATOR-UNDRAIN %s %s" % (p["node"], n["reason"]))
+
+
+def pod_json(p):
+    """A slurmd pod as `kubectl get pods -o json` lists it, with the fields
+    the operator derives the Slurm node name from (GetSlurmNodeName)."""
+    mode = (st["nodesets"][0].get("spec") or {}).get("scalingMode", "StatefulSet")
+    return {
+        "apiVersion": "v1", "kind": "Pod",
+        "metadata": {"name": p["name"], "namespace": "slurm", "uid": p["uid"],
+                     "labels": {"app.kubernetes.io/name": "slurmd",
+                                "nodeset.slinky.slurm.net/scaling-mode": mode,
+                                "nodeset.slinky.slurm.net/pod-hostname": p["node"]}},
+        "spec": {"hostname": p["node"], "nodeName": "kind-worker"},
+    }
+
+
 def scontrol_update(rest):
     kv = {}
     for a in rest[2:]:
@@ -324,6 +366,9 @@ if verb == "get" and args[1] == "pods":
     if "app.kubernetes.io/name=slurmd" in joined:
         if fmt == "name":
             out("".join("pod/%s\n" % p["name"] for p in st["slurmd"]))
+        elif fmt == "json":
+            out(json.dumps({"apiVersion": "v1", "kind": "List",
+                            "items": [pod_json(p) for p in st["slurmd"]]}))
         elif "containerStatuses" in fmt:
             ready = "false" if env("FAKE_PODS_NEVER_READY") == "1" else "true"
             out("".join("%s %s\n" % (p["uid"], ready) for p in st["slurmd"]))
@@ -349,12 +394,18 @@ if verb == "delete" and args[1] == "pod":
         n = st["nodes"][p["node"]]
         n["state"] = "down"
         n["reason"] = "slurm-operator: Pod is terminating"
-        # The replacement pod.
+        # The replacement pod. In DaemonSet mode it gets a new name
+        # (GenerateName in NewNodeSetDaemonSetPod, v1.2.0).
         p["uid"] = next_uid()
+        if (st["nodesets"][0].get("spec") or {}).get("scalingMode") == "DaemonSet":
+            p["name"] = "slurm-worker-slinky-%s" % p["uid"].replace("uid-", "x")
         if env("FAKE_SLURMD_STALE") == "1":
             p["key"] = st["node_cache"]
         else:
             p["key"] = live
+    if env("FAKE_OPERATOR") == "1":
+        for p in st["slurmd"]:
+            operator_sync_cordon(p)
     done()
 
 if verb == "rollout":

@@ -57,8 +57,9 @@ cert-manager 1.20 is the newest line whose
 Kubernetes 1.32; 1.21 starts at 1.33. CI prints `helm list -A` and each
 node's kubelet and container-runtime versions on every run (`make versions`),
 so each run records the charts and Kubernetes version it tested; it does not
-record the node image digest. The pinned
-configuration has not been run on a cluster yet (see [Honest scope](#honest-scope)).
+record the node image digest. The pinned configuration has run on a cluster
+once, in the KinD job of 2026-09-27: the bring-up and a job passed, the
+rotation step did not (see [Honest scope](#honest-scope)).
 `make up SLINKY_VERSION=` (empty) installs the latest instead; a weekly CI job
 does exactly that to catch drift.
 
@@ -274,6 +275,56 @@ reason exactly: the operator sets other `slurm-operator: ` reasons too, for
 example when a Kubernetes node is cordoned, and those are drains the script
 must not lift.
 
+**Then the operator rewrites it again.** The operator treats a reason that
+is empty or carries its `slurm-operator: ` prefix as its own, and any other
+reason as set externally, which it leaves alone (`IsNodeReasonOurs`,
+`internal/controller/nodeset/slurmcontrol/slurmcontrol.go` lines 391-419 at
+v1.2.0). The preStop reason carries that prefix, so once the new pod is up
+and not cordoned, the NodeSet controller undrains the node with reason
+`slurm-operator: Pod (<namespace>/<pod>) was uncordoned` (`syncCordon`,
+`internal/controller/nodeset/nodeset_sync.go` lines 456-563; the undrain is
+lines 548-553, `MakeNodeUndrain` in `slurmcontrol.go` adds the prefix and
+acts only on a node with the DRAIN flag). Slurm clears only that flag
+(`update_node` in `src/slurmctld/node_mgr.c`, read at a 26.11 development
+snapshot), so the node stays DOWN until it is resumed. The KinD job on
+2026-09-27 hit exactly this: after the failed rotation's first pod
+replacement, the rollback re-read `slinky-0`, took that reason for someone
+else's drain, left the node out of service and exited 4 instead of 3.
+
+The script now counts that reason as its own only when all four hold: the
+node is one its drain step drained; the reason is exactly `slurm-operator: Pod
+(<namespace>/<pod>) was uncordoned`, compared as a whole string, so anything
+added before or after it does not count; that pod is a slurmd pod on that
+node which the run replaced, or the pod that replaced it (in DaemonSet mode
+the replacement has a new name, and that is the one the operator names); and
+the node does not carry the DRAIN flag (`sinfo` shows neither `drain` nor
+`drng`, nor `boot`, behind which a pending reboot hides the flag). Pods are
+mapped to Slurm nodes the way the operator does it (`GetSlurmNodeName`,
+`internal/controller/nodeset/utils/utils.go` lines 334-346).
+
+The DRAIN flag matters because the operator's cordon drains keep a reason
+the node already has. In v1.2.0 both of them, for a cordoned Kubernetes node
+(lines 497-539) and for a pod carrying the
+`nodeset.slinky.slurm.net/pod-cordon` annotation, which an admin can set
+(lines 541-546), drain through `MakeNodeDrain` with `overrideReason` false
+(`slurmcontrol.go` lines 227-231). A cordon that lands after the operator's
+undrain therefore drains the node again under exactly the reason above, and
+only the flag tells the two apart: the UNDRAIN that writes that reason is
+the write that clears the flag. (Slurm refuses the UNDRAIN on a node whose
+registration was invalid, shown as `inval`, and refuses a RESUME there too.)
+The operator's own cordon reasons, `Pod (<namespace>/<pod>) was cordoned` and
+`Node (...) was cordoned, Pod (...) must be cordoned` (or the node's
+conditions, or its `node-cordon-reason` annotation), appear only on a node
+that had no reason.
+
+Every other reason is still someone else's: handed over, never resumed,
+exit 4. The automatic rollback and `--rollback` share this check, so both
+are fixed. One blind spot remains, and it is older than this check: a cordon
+that lands before the operator's undrain, while the preStop reason is still
+on the node, keeps the preStop reason, and that reason legitimately sits
+next to this run's own DRAIN flag, so the script cannot tell the cordon from
+its own drain.
+
 **A verification that does not cross the broken boundary always passes.** This
 one cost several CI runs and is the most useful thing in the repo — see below.
 
@@ -389,7 +440,9 @@ The operator sets that and never clears it — ninety seconds of watching showed
 no self-heal. (`sinfo -R` shows only the first 20 characters of a reason. The
 full one is most likely `slurm-operator: Pod is terminating` from the slurmd
 preStop hook, which sets the node DOWN; the operator's own cordon path drains
-instead.) So an explicit
+instead. On a node that was drained first, as the rotation's are, the
+operator does replace the reason, with "Pod (...) was uncordoned", but the
+node is still DOWN; see "Then the operator rewrites it again" above.) So an explicit
 `RESUME` is mandatory after any pod replacement, and it must be re-issued
 rather than fired once.
 
@@ -496,14 +549,15 @@ looking.
 ## Tests
 
 ```
-make test    # offline: the rotation script against a fake kubectl (39 scenarios, 92-98 s on a Mac)
+make test    # offline: the rotation script against a fake kubectl (46 scenarios, about 140 s on a Mac)
 make lint    # bash -n and shellcheck on every shell script
 ```
 
 `tests/run.sh` runs the real script against `tests/fake/kubectl.py`, a fake
 cluster that models the behaviour the script depends on: immutable Secrets
 that can only be deleted and recreated, owner-reference garbage collection,
-the slurmd preStop hook, the stale-key failure, and Slurm's DRAIN/RESUME
+the slurmd preStop hook, the operator's undrain that follows it, the
+stale-key failure, and Slurm's DRAIN/RESUME
 rules, including Slurm's busy state suffixes (`alloc+`, `mix-`, `plnd`). It
 covers the paths the KinD job cannot reach — drain timeouts, API errors and a
 SIGTERM between deleting and recreating the live Secret, pre-drained nodes, a
@@ -558,14 +612,20 @@ v0.8.0) and a Python with PyYAML (`PYTHON=...`), as do
 
 - **KinD only, so far.** The Helm values and rotation apply to any Kubernetes,
   but the bring-up path is local. Cloud is the obvious next step.
-- **Not re-run on a cluster since the September 2026 changes.** The scoped
-  drain, the staged Secret replacement and the stricter measurements are
-  covered by the offline tests (against a fake kubectl) and by shellcheck.
-  Pinning is checked offline only as far as `scripts/ci/validate-manifests.sh`
-  goes: it renders the pinned Slinky chart and validates the output. Nothing
-  offline pulls the pinned node image or the cert-manager chart, and the new
-  steps of the KinD CI job are not exercised by anything offline; the KinD job
-  has to run once before any of this counts as proven on a real cluster.
+- **One cluster run since the September 2026 changes, and it did not pass.**
+  The pinned KinD job ran once, on 2026-09-27. It brought the cluster up with
+  the pinned versions and ran a job, then ran the real rotation: drain,
+  backup, rotate and the key measurement, which failed as documented (slurmd
+  kept the previous key). The script rolled back, restored the previous key
+  and measured it in every slurmd pod and in slurmctld, but exited 4 instead
+  of 3, because it took the operator's undrain reason for someone else's
+  drain (see "Then the operator rewrites it again" above). The fix for that,
+  like the rest of those changes (the scoped drain, the staged Secret
+  replacement, the stricter measurements), is covered only offline, by the
+  tests against a fake kubectl and by shellcheck. The rotation step
+  (exit 3), the manual-rollback step, the `--jwt` step and the job runs after
+  each have not passed on a cluster yet; the KinD job has to pass before they
+  count as proven.
 - **One nodeset, one replica.** Enough to prove registration and job execution;
   multi-nodeset scheduling, GPU (GRES) classes and autoscaling profiles are not
   built.

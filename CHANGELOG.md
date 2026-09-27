@@ -7,10 +7,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 Changes made in response to an audit of the repository
-(September 2026). **None of this has been run on a Kubernetes cluster yet**:
-it is covered by new offline tests, shellcheck and manifest validation (see
-"How this was checked" below), and the KinD job in CI has to run before it
-counts as proven on a real cluster.
+(September 2026). **None of this had been run on a Kubernetes cluster
+before the KinD run of 2026-09-27**, which found the defect listed under
+"Found by the first KinD run" below: it is covered by new offline tests,
+shellcheck and manifest validation (see "How this was checked" below), and
+the KinD job in CI has to pass before it counts as proven on a real cluster.
 
 ### Fixed
 
@@ -102,6 +103,60 @@ release:
 - **The documented Role grants `list` and `watch` on Secrets**, which
   `kubectl delete --wait` needs; the script's delete wait is now bounded by
   `--timeout` (kubectl's own default is a week).
+
+Found by the first KinD run of the changes above (2026-09-27, `bring-up
+(pinned)`, Slinky v1.2.0), and fixed:
+
+- **The operator's own undrain after a pod replacement is no longer taken for
+  someone else's drain.** The rotation failed as documented and the previous
+  key was restored and verified in every slurmd pod and slurmctld, but the run
+  exited 4, not 3: the rollback re-read `slinky-0` and found `slurm-operator:
+  Pod (slurm/slurm-worker-slinky-0) was uncordoned`, handed the node over as
+  "drained by someone else", and left it out of service. That reason is the
+  operator's. It counts a node whose reason is empty or carries its prefix
+  as its own (`IsNodeReasonOurs`, `slurmcontrol.go` lines 391-419 at
+  v1.2.0); the slurmd preStop reason carries the prefix, so, the new pod not
+  being cordoned, it undrains the node (`syncCordon`,
+  `internal/controller/nodeset/nodeset_sync.go` lines 456-563; the undrain at
+  548-553). The node stays DOWN. The script now treats that reason as its own
+  only when the node is one its drain step drained, the reason is exactly
+  `slurm-operator: Pod (<namespace>/<pod>) was uncordoned` (a whole-string
+  comparison), the pod is a slurmd pod on that node which the run replaced,
+  or its replacement, mapped to its Slurm node the way the operator maps it
+  (`GetSlurmNodeName`, `internal/controller/nodeset/utils/utils.go` lines
+  334-346), and the node does not carry the DRAIN flag (`sinfo` state not
+  `drain`, `drng` or `boot`). The last condition is needed because the
+  operator's cordon drains, for a cordoned Kubernetes node and for a pod
+  with the `pod-cordon` annotation, keep any reason the node already has
+  (`MakeNodeDrain` with `overrideReason` false, `slurmcontrol.go` lines
+  227-231): a cordon that lands after the undrain drains the node again under
+  exactly that reason, while the undrain itself is the write that clears the
+  flag. Without that condition such a cordon would be resumed and the
+  rotation reported complete. Every other reason, including the operator's
+  `Pod (...) was cordoned` and `Node (...) was cordoned, ...` (written only on
+  a node that had no reason), is still someone else's (left drained, exit 4). The
+  automatic rollback and `--rollback` share the check, so the manual-rollback
+  CI step (not reached in the failing run; its own pod replacement is judged
+  by the same check) is covered too. What remains is the older blind spot: a
+  cordon that lands before the operator's undrain keeps the preStop reason,
+  which is accepted next to this run's own DRAIN flag.
+  `scripts/ci/assert-rotation.sh` still requires exit 3.
+- The fake kubectl models the operator's undrain (`FAKE_OPERATOR=1`) and, in
+  DaemonSet mode, the new name a replacement pod gets. With the previous
+  script it reproduces the CI failure: the same messages in the same order,
+  and exit 4. New tests: that reason on a node the run drained, naming the pod
+  it replaced there, is its own (exit 3 in the CI's one-node shape, then a
+  manual `--rollback` exits 0, both CI assertions pass; a rotation whose key
+  takes exits 0; DaemonSet mode exits 3); the same message for another node's
+  pod, a pod that does not exist, or another namespace, `Pod (...) was
+  cordoned`, an admin's reason, and lookalikes with text added before or
+  after, without the prefix, or with an escape that `awk -v` turns into the
+  real reason (BSD awk does) are all someone else's (exit 4, never resumed); a
+  node handed over is not taken back when the operator later writes the
+  accepted reason on it; a node drained before the run stays drained; and a
+  cordon drain that keeps the accepted reason after the operator's undrain is
+  someone else's, both in the resume loop (the key takes) and in the
+  rollback's re-read (it does not).
 
 ### Added
 
@@ -229,6 +284,30 @@ After the second review's fixes, re-checked on the same machine on
 Not run: the KinD job, or anything else needing a cluster (none was
 available). bash 5 and mawk, which CI's Ubuntu runner uses, were not
 available locally either; CI will be the first run on them.
+
+After the operator-undrain fix, on the same machine on 2026-09-27 (bash
+3.2.57, BSD awk, Python 3.12.13):
+
+- `tests/run.sh`: 46 of 46 scenarios pass. The test for a cordon after the
+  operator's undrain was run against the fix without the DRAIN-flag
+  condition: the key-takes case exited 0 with "Rotation complete." after
+  resuming `slinky-0`, the rollback case exited 3 after resuming it; both are
+  caught. Leaving the state out at the rollback's re-read is caught too: an
+  unknown state counts as drained, so `slinky-1`, which carries the
+  operator's undrain of its own pod, is handed over as well. The other new
+  tests were run against the previous script (the exit-3 test fails with
+  exit 4, as in CI) and against six broken variants of the fix, before the
+  DRAIN-flag condition was added: no fix, any pod name accepted, substring
+  match, pod on any node, `was cordoned` accepted too, comparison through
+  `awk -v`; each is caught. Dropping the recording of replacement
+  pods is caught by the DaemonSet-mode test; dropping the recording of the
+  deleted pods is not (in StatefulSet mode the names are the same, and the
+  fake has no case where only that record matters).
+- shellcheck 0.11.0 on the same 7 shell scripts: no findings. `bash -n` on
+  each: clean. The 5 YAML files parse with PyYAML 6.0.3.
+
+Not run: the KinD job. Whether the real operator and cluster behave as the
+fake now models them is for the PR's CI to show.
 
 ## [0.1.0] - 2026-07-31
 
