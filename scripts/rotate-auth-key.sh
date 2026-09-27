@@ -206,9 +206,20 @@ DRAIN_REASON="rotate-auth-key $RUN_ID"
 # (a cordoned Kubernetes node, propagated node conditions), and those are its
 # drains, not the residue of a pod replacement.
 PRESTOP_REASON="slurm-operator: Pod is terminating"
+# The one other reason a pod replacement leaves behind, written by the
+# operator rather than the pod. The operator counts a node whose reason is
+# empty or carries its prefix as its own (IsNodeReasonOurs), and the preStop
+# reason carries that prefix, so when the new pod is not cordoned it undrains
+# the node with reason "slurm-operator: Pod (<namespace>/<pod>) was
+# uncordoned" (syncCordon, internal/controller/nodeset/nodeset_sync.go lines
+# 456-563 at v1.2.0). Slurm's UNDRAIN clears only the DRAIN flag, so a node
+# the preStop hook set DOWN stays DOWN until this run resumes it. See
+# operator_undrained_ours for when that reason counts as this run's.
 
 # ── State the exit trap reads ────────────────────────────────────────────────
 OUR_NODES=""            # nodes this run drained and still holds: the only ones it resumes
+DRAINED_NODES=""        # nodes this run's drain step drained (never shrinks)
+REPLACED_PODS=""        # "namespace/pod<TAB>Slurm node" of slurmd pods this run replaced, and their replacements
 LEFT_ALONE=""           # "name<TAB>state<TAB>reason" of nodes not in service at start
 EXTERNAL_DRAINS=""      # "name<TAB>state<TAB>reason" of nodes of ours someone else drained mid-run
 START_SHAS=""           # "SECRET SHA" of each live key at preflight, for the exit-1 promise
@@ -348,26 +359,69 @@ wait_controller_ready() {
 
 # ── Node drain and resume, scoped to the nodes this run drained ──────────────
 
-# Could this run have set REASON on a node it drained? Before any slurmd pod
-# is replaced, only its own drain tag. After a replacement, also the preStop
-# reason, and what Slurm itself records for a node whose slurmd has not come
-# back yet ("Not responding", or no reason on a node such as `idle*`).
+# reason_is_ours NODE REASON STATE: could this run have set REASON on NODE, a
+# node it drained, now in sinfo state STATE? Before any slurmd pod is
+# replaced, only its own drain tag. After a replacement, also the preStop
+# reason, what Slurm itself records for a node whose slurmd has not come back
+# yet ("Not responding", or no reason on a node such as `idle*`), and the
+# operator's undrain that follows the preStop reason (operator_undrained_ours).
 #
 # Anything else was set by someone else -- an epilog health check draining a
 # node with `scontrol update State=DRAIN`, which replaces the reason, or the
 # operator's own drain of a cordoned Kubernetes node ("slurm-operator: Node
-# (...) was cordoned, ..."). An earlier version accepted every
+# (...) was cordoned, ...") or of a cordoned pod ("slurm-operator: Pod (...)
+# was cordoned"). An earlier version accepted every
 # "slurm-operator: " reason and judged only the *current* reason, so a node
 # drained for a GPU fault during the drain wait was resumed as soon as the
 # pod replacement had rewritten its reason, and resumed unconditionally when
 # the run stopped before the replacement.
 reason_is_ours() {
-  [ "$1" = "$DRAIN_REASON" ] && return 0
+  [ "$2" = "$DRAIN_REASON" ] && return 0
   [ "$PODS_CYCLED" -eq 1 ] || return 1
-  case "$1" in
+  case "$2" in
     ""|"$PRESTOP_REASON"|"Not responding") return 0 ;;
-    *) return 1 ;;
   esac
+  operator_undrained_ours "$1" "$2" "${3:-}"
+}
+
+# operator_undrained_ours NODE REASON STATE: REASON is the operator's undrain
+# of NODE after this run replaced its slurmd pod. All of these must hold:
+#   - NODE is one this run's drain step drained (DRAINED_NODES);
+#   - REASON is exactly "slurm-operator: Pod (<namespace>/<pod>) was
+#     uncordoned" -- compared as a whole string, never as a pattern, so a
+#     reason with anything before or after it does not count;
+#   - <namespace>/<pod> is a slurmd pod on NODE that this run replaced, or
+#     the pod that replaced it (REPLACED_PODS: the operator names the pod it
+#     is reconciling, which in DaemonSet mode has a new name);
+#   - NODE does not show the DRAIN flag: STATE is known (empty counts as
+#     drained) and is not drain or drng (with any suffix), nor boot (a
+#     pending reboot, which this run never requests, hides the flag in
+#     sinfo's compact state).
+# The operator writes that reason only on a node whose reason is empty or
+# carries its prefix (IsNodeReasonOurs), which after this run's drain means
+# the preStop reason of this run's replacement (or one of its own cordon
+# reasons being lifted), and the UNDRAIN that writes it clears the DRAIN
+# flag. (Not on a node Slurm marks INVALID_REG, shown as `inval`: Slurm
+# writes the reason and refuses the UNDRAIN, and it refuses RESUME there too.)
+# The flag coming back means someone drained the node again, and in v1.2.0
+# the operator's own cordon drains (a cordoned Kubernetes node, the
+# pod-cordon annotation) keep a reason the node already has (MakeNodeDrain
+# with overrideReason false), so their drain arrives under this very reason.
+# Every other reason stays someone else's, including "Pod (...) was
+# cordoned" and "Node (...) was cordoned, ...", which the operator writes
+# only on a node that had no reason.
+operator_undrained_ours() {
+  local node="$1" reason="$2" state="${3:-}" pod n
+  [ -n "$node" ] || return 1
+  case "$state" in ""|drain*|drng*|boot*) return 1 ;; esac
+  printf '%s\n' "$DRAINED_NODES" | grep -qxF -- "$node" || return 1
+  while IFS=$'\t' read -r pod n; do
+    { [ -n "$pod" ] && [ "$n" = "$node" ]; } || continue
+    [ "$reason" = "slurm-operator: Pod ($pod) was uncordoned" ] && return 0
+  done <<EOF
+$REPLACED_PODS
+EOF
+  return 1
 }
 
 csv() { printf '%s\n' "$1" | awk 'NF' | paste -sd, -; }
@@ -403,7 +457,7 @@ claim_before_cycle() {
   for n in $OUR_NODES; do
     st=$(printf '%s\n' "$tbl" | node_field "$n" 2)
     reason=$(printf '%s\n' "$tbl" | node_field "$n" 3)
-    reason_is_ours "$reason" && continue
+    reason_is_ours "$n" "$reason" "$st" && continue
     if printf '%s\n' "$st" | grep -qE "$IN_SERVICE_RE"; then
       # Not drained any more: someone resumed it. Nothing of theirs to
       # preserve, and its pod is replaced regardless, so it stays in the set
@@ -441,7 +495,7 @@ resume_until_schedulable() {
         st=$(printf '%s\n' "$tbl" | node_field "$n" 2)
         if printf '%s\n' "$st" | grep -qE "$SCHEDULABLE_RE"; then continue; fi
         reason=$(printf '%s\n' "$tbl" | node_field "$n" 3)
-        if reason_is_ours "$reason"; then
+        if reason_is_ours "$n" "$reason" "$st"; then
           pending="$pending$n (${st:-missing}${reason:+, $reason})"$'\n'
           ctl_exec scontrol update "NodeName=$n" State=RESUME >/dev/null 2>&1 || true
         else
@@ -623,6 +677,25 @@ slurmd_uids_ready() {
     -o jsonpath='{range .items[*]}{.metadata.uid}{" "}{.status.containerStatuses[*].ready}{"\n"}{end}' 2>/dev/null
 }
 
+# record_replaced [SKIP_UIDS]: add "namespace/pod<TAB>Slurm node" of every
+# slurmd pod, except those whose uid is in SKIP_UIDS, to REPLACED_PODS. The
+# Slurm node is the one the operator writes that pod's reasons on
+# (authkey.py slurmd-nodes). If the pods cannot be listed nothing is added,
+# and an operator reason naming them then counts as someone else's: exit 4,
+# as before this bookkeeping existed.
+record_replaced() {
+  local j pods
+  if j=$(k get pods -l app.kubernetes.io/name=slurmd -o json 2>/dev/null) \
+     && pods=$(printf '%s' "$j" | py slurmd-nodes 2>/dev/null); then
+    pods=$(printf '%s\n' "$pods" | awk -F '\t' -v skip="$(printf '%s\n' "${1:-}" | tr '\n' ' ')" '
+      BEGIN { n = split(skip, s, " "); for (i = 1; i <= n; i++) old[s[i]] = 1 }
+      NF >= 3 && !($2 in old) { printf "%s\t%s\n", $1, $3 }')
+    REPLACED_PODS=$(printf '%s\n%s\n' "$REPLACED_PODS" "$pods" | awk 'NF && !seen[$0]++')
+  else
+    warn "could not map the slurmd pods to their Slurm nodes; an operator reason naming one will be treated as someone else's"
+  fi
+}
+
 # Restart every daemon that reads the key.
 #
 # `kubectl rollout restart` only understands built-in workload kinds. Checked
@@ -643,6 +716,7 @@ cycle_slurm_pods() {
   old=$(slurmd_uids_ready | awk 'NF { print $1 }') || old=""
   k rollout restart statefulset,deployment,daemonset -l app.kubernetes.io/instance=slurm >/dev/null 2>&1 \
     || warn "rollout restart of the controller and restapi failed"
+  record_replaced   # the pods about to be deleted, for reason_is_ours
   k delete pod -l app.kubernetes.io/name=slurmd --wait=false >/dev/null 2>&1 \
     || { warn "could not delete the slurmd pods"; return 1; }
   # Every preStop hook has just rewritten its node's reason, including any
@@ -664,6 +738,7 @@ cycle_slurm_pods() {
       { pods++; if ($1 in was) stale++; if (NF < 2 || $0 ~ /false/) notready++ }
       END { print (pods >= want && pods > 0 && !stale && !notready) ? "yes" : "no" }')
     if [ "$ready_all" = "yes" ]; then
+      record_replaced "$old"   # and the pods that replaced them
       wait_controller_ready || warn "controller did not become ready in ${TIMEOUT}s"
       return 0
     fi
@@ -996,6 +1071,7 @@ step "3/6  Drain"
 DRAIN_ACTIVE=1
 ctl_exec scontrol update "NodeName=$(csv "$OUR_NODES")" State=DRAIN "Reason=$DRAIN_REASON" >/dev/null 2>&1 \
   || die "scontrol could not drain $(csv "$OUR_NODES"); nothing was changed"
+DRAINED_NODES="$OUR_NODES"
 ok "drained $(csv "$OUR_NODES")"
 
 # Replacing the slurmd pods kills whatever runs on them, so every job has to

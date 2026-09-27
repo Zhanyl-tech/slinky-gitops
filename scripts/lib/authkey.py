@@ -26,6 +26,7 @@ Usage: authkey.py MODE [ARGS...]   (input on stdin, output on stdout)
   annotation NAME            Secret -> value of annotation NAME ("" if absent)
   fingerprint KEY            Secret -> one line of JSON: what CI compares before/after
   nodesets                   NodeSetList -> one line per NodeSet that has not converged
+  slurmd-nodes               PodList -> "namespace/name<TAB>uid<TAB>Slurm node" per pod
 
 Exit status: 0 on success, 3 when the input cannot be parsed or lacks what the
 mode needs (so the shell can tell "bad input" from "empty answer").
@@ -302,6 +303,42 @@ def nodesets(doc):
     return bad
 
 
+SCALING_MODE_LABEL = "nodeset.slinky.slurm.net/scaling-mode"
+
+
+def slurm_node_name(pod):
+    """The Slurm node a NodeSet pod is, as the operator computes it.
+
+    Mirrors GetSlurmNodeName (internal/controller/nodeset/utils/utils.go
+    lines 334-346 at slurm-operator v1.2.0): that is the node the operator
+    writes this pod's drain and undrain reasons on.
+    """
+    md = pod.get("metadata") or {}
+    spec = pod.get("spec") or {}
+    if (md.get("labels") or {}).get(SCALING_MODE_LABEL) == "StatefulSet":
+        if spec.get("hostNetwork"):
+            return spec.get("nodeName") or ""
+        return spec.get("hostname") or md.get("name") or ""
+    return spec.get("hostname") or ""
+
+
+def slurmd_nodes(doc):
+    """One (namespace/name, uid, Slurm node) per pod whose node is known.
+
+    namespace/name is how klog.KObj prints the pod, which is how the
+    operator names it in a reason ("Pod (slurm/slurm-worker-slinky-0) ...").
+    """
+    rows = []
+    for pod in doc.get("items") or []:
+        md = pod.get("metadata") or {}
+        node = slurm_node_name(pod)
+        if not md.get("name") or not node:
+            continue
+        ns = md.get("namespace") or ""
+        rows.append(("%s/%s" % (ns, md["name"]) if ns else md["name"], md.get("uid") or "", node))
+    return rows
+
+
 def main(argv):
     if not argv:
         raise BadInput("no mode given")
@@ -340,6 +377,10 @@ def main(argv):
         need(0)
         for line in nodesets(load()):
             print(line)
+    elif mode == "slurmd-nodes":
+        need(0)
+        for row in slurmd_nodes(load()):
+            print("\t".join(row))
     else:
         raise BadInput("unknown mode %r" % mode)
     return 0
